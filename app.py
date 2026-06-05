@@ -1,12 +1,10 @@
 """
-Career OS — Agente WhatsApp v5
-Fluxo: WhatsApp → transcrição Z-API (áudio) → Claude → Make webhook → Asana/Notion/Calendar/etc.
-v5: integração Make, transcrição de voz nativa Z-API, self-ping anti-sleep
+Career OS — Agente WhatsApp v5.1
+v5.1: debug endpoint + fallback catch-all (sempre responde) + fix payload Z-API áudio
 """
 
 from flask import Flask, request, jsonify
 import urllib.request
-import urllib.parse
 import json
 import os
 import threading
@@ -14,7 +12,6 @@ import time
 
 app = Flask(__name__)
 
-# ── Variáveis de ambiente ────────────────────────────────────────────────────
 ANTHROPIC_KEY     = os.environ["ANTHROPIC_KEY"]
 NOTION_TOKEN      = os.environ["NOTION_TOKEN"]
 ZAPI_INSTANCE     = os.environ["ZAPI_INSTANCE"]
@@ -23,17 +20,16 @@ ZAPI_CLIENT_TOKEN = os.environ["ZAPI_CLIENT_TOKEN"]
 ZAPI_BASE         = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
 MAKE_WEBHOOK_URL  = os.environ.get("MAKE_WEBHOOK_URL", "https://hook.us2.make.com/mpcr21sy4xdfxuw454x70e86ese0ppxt")
 RENDER_URL        = os.environ.get("RENDER_URL", "https://careeros-whatsapp-agent.onrender.com")
-PING_INTERVAL     = 4 * 60  # 4 min — Render dorme após 15min
+PING_INTERVAL     = 4 * 60
 
-# ── System prompt ────────────────────────────────────────────────────────────
+# Armazena últimos 5 payloads recebidos (para debug)
+_last_payloads = []
 
 SYSTEM_PROMPT = """Você é o agente de IA do Career OS de Luiz Vechiato.
 
 Recebe mensagens via WhatsApp (texto ou transcrição de voz) e transforma em ações executáveis.
 
-TAREFA PRINCIPAL:
-Converter a mensagem em um texto limpo e direto para criar uma tarefa, nota ou ação.
-Retorne SEMPRE um JSON com este formato:
+Converta a mensagem em um JSON com este formato EXATO:
 
 {
   "text": "Texto limpo da tarefa/nota/ação — direto, sem pronomes desnecessários",
@@ -42,68 +38,75 @@ Retorne SEMPRE um JSON com este formato:
 }
 
 REGRAS:
-- "text" deve ser o conteúdo principal — direto, sem "Eu preciso", "Quero", etc.
-- Use verbos no infinitivo para tarefas: "Enviar proposta para X", "Revisar CV"
-- Para notas: título claro + conteúdo separado por " — "
-- Para agenda: inclua data/hora se mencionado: "Reunião com X — 15/06 14h"
-- "confirmacao" sempre termina com um CTA curto
-- Máximo 2 linhas na confirmacao — WhatsApp não é email
+- "text": conteúdo direto — verbos no infinitivo para tarefas ("Enviar CV para João")
+- Para agenda: inclua data/hora se mencionado ("Reunião com Laura — sexta 10h")
+- "confirmacao": máximo 2 linhas, sempre termina com um CTA curto
+- Retorne APENAS o JSON, sem texto adicional"""
 
-EXEMPLOS:
-Entrada: "lembra de mandar o currículo pro João amanhã"
-Saída: {"text": "Enviar currículo para João", "tipo": "tarefa", "confirmacao": "✅ Tarefa criada: Enviar currículo para João\n\nO que mais posso registrar?"}
 
-Entrada: "reunião com a Laura na sexta às 10"
-Saída: {"text": "Reunião com Laura — sexta 10h", "tipo": "agenda", "confirmacao": "✅ Registrado: Reunião com Laura na sexta às 10h\n\nQuer que eu adicione algum contexto?"}
-
-Entrada: "insight interessante: empresas de IA estão priorizando perfis bilíngues com experiência em go-to-market"
-Saída: {"text": "Insight de mercado — Empresas de IA priorizando perfis bilíngues com experiência GTM", "tipo": "nota", "confirmacao": "✅ Nota registrada no Career OS\n\nQuer explorar esse insight ou registrar mais alguma coisa?"}"""
-
-# ── Self-ping anti-sleep ─────────────────────────────────────────────────────
+# ── Self-ping ────────────────────────────────────────────────────────────────
 
 def self_ping_loop():
     time.sleep(60)
     while True:
         try:
-            req = urllib.request.Request(f"{RENDER_URL}/health")
-            with urllib.request.urlopen(req, timeout=10) as r:
-                print(f"🔁 Self-ping OK — {r.status}")
+            with urllib.request.urlopen(f"{RENDER_URL}/health", timeout=10) as r:
+                print(f"🔁 Self-ping {r.status}")
         except Exception as e:
-            print(f"⚠️  Self-ping falhou: {e}")
+            print(f"⚠️ Self-ping: {e}")
         time.sleep(PING_INTERVAL)
 
-def iniciar_self_ping():
-    t = threading.Thread(target=self_ping_loop, daemon=True)
-    t.start()
-    print(f"🔁 Self-ping iniciado ({PING_INTERVAL//60}min)")
+threading.Thread(target=self_ping_loop, daemon=True).start()
 
 
-# ── Z-API: transcrição de áudio ──────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def zapi_transcrever_audio(audio_url):
-    """Transcreve áudio via Z-API audio-to-text."""
-    headers = {
-        "Content-Type": "application/json",
-        "Client-Token": ZAPI_CLIENT_TOKEN
-    }
-    payload = {"url": audio_url}
+def zapi_enviar(telefone, mensagem):
+    headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
+    req = urllib.request.Request(
+        f"{ZAPI_BASE}/send-text",
+        data=json.dumps({"phone": telefone, "message": mensagem}).encode(),
+        headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read())
+            print(f"✅ Enviado: {result.get('messageId','?')}")
+    except Exception as e:
+        print(f"❌ Erro envio: {e}")
+
+
+def zapi_transcrever(audio_url):
+    headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
     req = urllib.request.Request(
         f"{ZAPI_BASE}/audio-to-text",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST"
+        data=json.dumps({"url": audio_url}).encode(),
+        headers=headers, method="POST"
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             result = json.loads(r.read())
-            print(f"🎙️ Transcrição: {result}")
+            print(f"🎙️ Transcrição result: {result}")
             return result.get("text") or result.get("transcription") or ""
     except Exception as e:
-        print(f"❌ Erro transcrição Z-API: {e}")
+        print(f"❌ Transcrição: {e}")
         return ""
 
 
-# ── Claude ───────────────────────────────────────────────────────────────────
+def enviar_make(texto, tipo="tarefa"):
+    req = urllib.request.Request(
+        MAKE_WEBHOOK_URL,
+        data=json.dumps({"text": texto, "tipo": tipo, "fonte": "whatsapp"}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            print(f"✅ Make: {r.read().decode()[:50]}")
+            return True
+    except Exception as e:
+        print(f"❌ Make: {e}")
+        return False
+
 
 def claude(mensagem):
     headers = {
@@ -120,100 +123,75 @@ def claude(mensagem):
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST"
+        headers=headers, method="POST"
     )
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read())["content"][0]["text"]
 
 
-# ── Make webhook ─────────────────────────────────────────────────────────────
-
-def enviar_para_make(texto, tipo="tarefa", metadata=None):
-    """Envia JSON para o webhook do Make."""
-    payload = {
-        "text": texto,
-        "tipo": tipo,
-        "fonte": "whatsapp",
-    }
-    if metadata:
-        payload.update(metadata)
-
-    req = urllib.request.Request(
-        MAKE_WEBHOOK_URL,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            resultado = r.read().decode()
-            print(f"✅ Make recebeu: {resultado[:100]}")
-            return True
-    except Exception as e:
-        print(f"❌ Erro Make webhook: {e}")
-        return False
+def extrair_audio_url(data):
+    """Tenta extrair URL de áudio de todos os formatos conhecidos do Z-API."""
+    # Formatos possíveis do Z-API para áudio/PTT
+    candidates = [
+        data.get("audio", {}).get("audioUrl"),
+        data.get("audio", {}).get("url"),
+        data.get("audioUrl"),
+        data.get("url"),
+        data.get("mediaUrl"),
+        data.get("audio", {}).get("mediaUrl"),
+        # Formato alternativo: dentro de "message"
+        data.get("message", {}).get("audioUrl") if isinstance(data.get("message"), dict) else None,
+    ]
+    for url in candidates:
+        if url and url.startswith("http"):
+            return url
+    return ""
 
 
-# ── Z-API: enviar mensagem ───────────────────────────────────────────────────
-
-def zapi_enviar(telefone, mensagem):
-    headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
-    payload = {"phone": telefone, "message": mensagem}
-    req = urllib.request.Request(
-        f"{ZAPI_BASE}/send-text",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            result = json.loads(r.read())
-            print(f"✅ Enviado para {telefone}: {result.get('messageId','?')}")
-            return result
-    except Exception as e:
-        print(f"❌ Erro Z-API envio: {e}")
-        return None
+def extrair_texto(data):
+    """Extrai texto de todos os formatos conhecidos do Z-API."""
+    candidates = [
+        data.get("text", {}).get("message") if isinstance(data.get("text"), dict) else data.get("text"),
+        data.get("body"),
+        data.get("message") if isinstance(data.get("message"), str) else None,
+        data.get("caption"),
+    ]
+    for t in candidates:
+        if t and isinstance(t, str) and t.strip():
+            return t.strip()
+    return ""
 
 
-# ── Parsing de mensagem ──────────────────────────────────────────────────────
-
-def extrair_mensagem(data):
-    """Extrai texto e tipo da mensagem Z-API."""
-    # Texto direto
-    texto = (
-        data.get("text", {}).get("message") or
-        data.get("body") or
-        data.get("message") or ""
-    )
-    if texto:
-        return texto.strip(), "texto", None
-
-    # Áudio — tenta pegar URL para transcrição
-    if data.get("audio") or data.get("type") in ("AudioMessage", "PTT"):
-        audio_url = (
-            data.get("audio", {}).get("audioUrl") or
-            data.get("audio", {}).get("url") or
-            data.get("audioUrl") or ""
-        )
-        return "", "audio", audio_url
-
-    # Imagem
-    if data.get("image"):
-        caption = data.get("image", {}).get("caption", "")
-        return f"[IMAGEM{': ' + caption if caption else ''}]", "imagem", None
-
-    return "", "desconhecido", None
+def detectar_tipo(data):
+    """Detecta se é áudio, texto, imagem, etc."""
+    tipo = data.get("type", "")
+    if tipo in ("PTT", "AudioMessage", "audio") or data.get("audio"):
+        return "audio"
+    if tipo in ("ImageMessage", "image") or data.get("image"):
+        return "imagem"
+    if tipo in ("VideoMessage", "video") or data.get("video"):
+        return "video"
+    if tipo in ("DocumentMessage", "document") or data.get("document"):
+        return "documento"
+    # Fallback: se tem texto, é texto
+    if extrair_texto(data):
+        return "texto"
+    return "desconhecido"
 
 
-# ── Webhook principal ────────────────────────────────────────────────────────
+# ── Rotas ────────────────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     telefone = ""
     try:
         data = request.get_json(force=True)
-        print(f"📩 Recebido: {json.dumps(data)[:300]}")
+        print(f"📩 PAYLOAD: {json.dumps(data)[:500]}")
+
+        # Armazenar para debug
+        _last_payloads.append(data)
+        if len(_last_payloads) > 5:
+            _last_payloads.pop(0)
 
         if data.get("fromMe"):
             return jsonify({"status": "ignored"}), 200
@@ -222,74 +200,94 @@ def webhook():
         if not telefone:
             return jsonify({"status": "no_phone"}), 200
 
-        texto, tipo, audio_url = extrair_mensagem(data)
+        tipo = detectar_tipo(data)
+        print(f"Tipo detectado: {tipo} | De: {telefone}")
 
-        # ── Áudio: transcrever ────────────────────────────────────────────
+        # ── Áudio ─────────────────────────────────────────────────────
         if tipo == "audio":
+            audio_url = extrair_audio_url(data)
+            print(f"🎙️ Audio URL: '{audio_url}'")
+
             if audio_url:
-                zapi_enviar(telefone, "🎙️ _Transcrevendo seu áudio..._")
-                transcricao = zapi_transcrever_audio(audio_url)
+                zapi_enviar(telefone, "🎙️ _Transcrevendo..._")
+                transcricao = zapi_transcrever(audio_url)
                 if transcricao:
-                    texto = transcricao
                     tipo = "texto"
-                    print(f"🎙️ Transcrito: '{texto[:80]}'")
+                    # Processar como texto abaixo
+                    texto_final = transcricao
                 else:
                     zapi_enviar(telefone,
                         "🎙️ Recebi o áudio mas não consegui transcrever.\n\n"
-                        "_Tenta mandar em texto — o que você queria registrar?_"
+                        "_Me manda em texto — o que queria registrar?_"
                     )
                     return jsonify({"status": "ok", "acao": "audio_sem_transcricao"}), 200
             else:
+                # Sem URL — pedir confirmação mas tentar processar mesmo assim
                 zapi_enviar(telefone,
                     "🎙️ Recebi seu áudio!\n\n"
-                    "Ainda não consegui acessar o arquivo de voz. "
-                    "_Me manda em texto e registro na hora._"
+                    "_Transcrição automática ainda não disponível para este formato. "
+                    "Me manda em texto e registro na hora._"
                 )
                 return jsonify({"status": "ok", "acao": "audio_sem_url"}), 200
 
-        # ── Imagem ────────────────────────────────────────────────────────
-        if tipo == "imagem":
-            zapi_enviar(telefone,
-                "🖼️ Recebi sua imagem!\n\n"
-                "_Ainda não processo imagens. Me manda o contexto em texto._"
-            )
-            return jsonify({"status": "ok", "acao": "imagem_sem_suporte"}), 200
+        # ── Texto ──────────────────────────────────────────────────────
+        elif tipo == "texto":
+            texto_final = extrair_texto(data)
 
-        # ── Sem conteúdo ──────────────────────────────────────────────────
-        if not texto:
+        # ── Imagem / outros ────────────────────────────────────────────
+        elif tipo == "imagem":
+            caption = data.get("image", {}).get("caption", "")
+            if caption:
+                texto_final = caption
+                tipo = "texto"
+            else:
+                zapi_enviar(telefone,
+                    "🖼️ Recebi sua imagem!\n\n"
+                    "_Ainda não processo imagens sem legenda. Descreve o que quer registrar?_"
+                )
+                return jsonify({"status": "ok", "acao": "imagem_sem_suporte"}), 200
+
+        # ── Catch-all: tipo desconhecido — SEMPRE responde ─────────────
+        else:
+            print(f"⚠️ Tipo desconhecido. Payload completo: {json.dumps(data)}")
             zapi_enviar(telefone,
-                "Recebi sua mensagem mas não identifiquei o conteúdo. 🤔\n\n"
+                "Recebi sua mensagem 👋\n\n"
+                "_Não identifiquei o tipo de conteúdo. Me manda em texto — o que posso fazer por você?_"
+            )
+            return jsonify({"status": "ok", "acao": "tipo_desconhecido", "tipo_detectado": tipo}), 200
+
+        # ── Sem texto ──────────────────────────────────────────────────
+        if not texto_final:
+            zapi_enviar(telefone,
+                "Recebi sua mensagem mas não encontrei o conteúdo. 🤔\n\n"
                 "_O que posso registrar ou fazer por você?_"
             )
             return jsonify({"status": "ok", "acao": "sem_conteudo"}), 200
 
-        # ── Claude: parsear intenção ───────────────────────────────────────
-        print(f"🤖 Claude processando: '{texto[:80]}'")
-        resposta_raw = claude(texto)
-        print(f"🤖 Claude retornou: {resposta_raw[:200]}")
-
+        # ── Claude → Make ──────────────────────────────────────────────
+        print(f"🤖 Claude: '{texto_final[:80]}'")
         try:
+            resposta_raw = claude(texto_final)
             rj = json.loads(resposta_raw)
-        except Exception:
-            # Claude não retornou JSON válido — usa texto direto
+        except Exception as e:
+            print(f"⚠️ Claude/JSON erro: {e} | raw: {resposta_raw[:100] if 'resposta_raw' in dir() else '?'}")
             rj = {
-                "text": texto,
+                "text": texto_final,
                 "tipo": "nota",
-                "confirmacao": f"✅ Registrado: {texto[:60]}\n\nQuer adicionar mais alguma coisa?"
+                "confirmacao": f"✅ Registrado: _{texto_final[:80]}_\n\nQuer adicionar mais alguma coisa?"
             }
 
-        texto_make = rj.get("text", texto)
-        tipo_acao = rj.get("tipo", "nota")
-        confirmacao = rj.get("confirmacao", f"✅ Registrado!\n\nQuer fazer mais alguma coisa?")
+        texto_make = rj.get("text", texto_final)
+        tipo_acao  = rj.get("tipo", "nota")
+        confirmacao = rj.get("confirmacao", "✅ Registrado!\n\nO que mais posso fazer?")
 
-        # ── Enviar para Make ──────────────────────────────────────────────
-        make_ok = enviar_para_make(texto_make, tipo_acao)
+        make_ok = enviar_make(texto_make, tipo_acao)
 
         if not make_ok:
             confirmacao = (
-                f"⚠️ Processado pelo CareerOS, mas houve um erro ao enviar para o Make.\n\n"
+                f"⚠️ Processado mas erro no Make.\n"
                 f"Conteúdo: _{texto_make}_\n\n"
-                f"_Tenta novamente ou me avisa se quiser registrar de outra forma._"
+                "_Tenta novamente?_"
             )
 
         zapi_enviar(telefone, confirmacao)
@@ -297,26 +295,30 @@ def webhook():
 
     except Exception as e:
         print(f"❌ Erro geral: {e}")
+        import traceback; traceback.print_exc()
         if telefone:
-            zapi_enviar(telefone,
-                "❌ Ocorreu um erro interno.\n\n"
-                "_Tenta novamente em instantes._"
-            )
+            zapi_enviar(telefone, "❌ Erro interno.\n\n_Tenta novamente em instantes._")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Retorna os últimos payloads recebidos — para diagnóstico."""
+    return jsonify({
+        "version": "5.1",
+        "last_payloads_count": len(_last_payloads),
+        "payloads": _last_payloads
+    }), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "Career OS Agent online ⚡",
-        "version": "5.0",
+        "version": "5.1",
         "make_webhook": MAKE_WEBHOOK_URL[:50] + "..."
     }), 200
 
-
-# ── Startup ──────────────────────────────────────────────────────────────────
-
-iniciar_self_ping()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
