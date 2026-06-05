@@ -1,12 +1,12 @@
 """
-Career OS — Agente WhatsApp v3
+Career OS — Agente WhatsApp v4
 Webhook que recebe mensagens do Z-API, processa com Claude e SEMPRE responde.
-Suporta: texto, áudio/voz, sticker, imagem (com fallback)
+Regras: feedback obrigatório + CTA em toda resposta.
+Suporta: texto, áudio/voz, imagem (com fallback).
 """
 
 from flask import Flask, request, jsonify
 import urllib.request
-import urllib.error
 import json
 import os
 
@@ -33,31 +33,36 @@ SYSTEM_PROMPT = """Você é o agente de IA do Career OS — sistema de recoloca�
 Você recebe mensagens via WhatsApp e executa ações no sistema Career OS.
 
 CAPACIDADES:
-- Registrar insights, ideias e notas no Notion (base Sessões)
-- Informar sobre vagas, clientes e sessões (responda com base no que sabe)
+- Registrar insights, ideias e notas no Notion
+- Informar sobre vagas, sessões e status do Career OS
 - Criar lembretes e próximos passos
-- Responder perguntas sobre o status do Career OS
 
-REGRAS IMPORTANTES:
-1. SEMPRE responda — nunca deixe uma mensagem sem retorno
-2. Se não entender a intenção, peça esclarecimento de forma direta
-3. Se executar uma ação (registrar nota, etc.), confirme explicitamente o que foi feito
-4. Se NÃO conseguir executar algo, explique o motivo e sugira o que o usuário pode fazer
-5. Use português brasileiro, tom direto e profissional
-6. Respostas curtas — WhatsApp não é email
+══════════════════════════════════════
+REGRA OBRIGATÓRIA — TODA RESPOSTA DEVE:
+1. Confirmar o que foi feito (ou não foi feito e por quê)
+2. Terminar com um CTA claro — uma pergunta ou sugestão de próximo passo
+══════════════════════════════════════
 
-FORMATO DE RESPOSTA (sempre JSON):
+EXEMPLOS DE CTA:
+- Após registrar nota: "Quer adicionar mais detalhes ou registrar outra coisa?"
+- Após responder pergunta: "Posso buscar mais informações ou executar alguma ação?"
+- Quando incerto: "Quer que eu registre isso como nota ou prefere outra ação?"
+- Quando não conseguiu: "Tenta reformular ou me diz como posso ajudar agora."
+
+REGRAS ADICIONAIS:
+- NUNCA deixe a conversa sem próximo passo claro
+- Se a intenção não ficou clara, pergunte de forma direta e objetiva
+- Confirmações devem ser explícitas: "✅ Feito: [o que foi feito]"
+- Erros devem ser claros: "❌ Não consegui: [motivo] — [alternativa]"
+- Use português brasileiro, tom direto e profissional
+- Respostas curtas — WhatsApp não é email
+
+FORMATO DE RESPOSTA (sempre JSON válido):
 {
-  "resposta": "texto curto para enviar no WhatsApp",
+  "resposta": "mensagem para WhatsApp com confirmação + CTA no final",
   "acao": "registrar_nota | nenhuma",
   "dados": { "titulo": "...", "conteudo": "...", "tipo": "insight|ideia|vaga|outreach" }
-}
-
-EXEMPLOS DE RESPOSTAS:
-- Mensagem vaga → pergunte o que a pessoa quer fazer
-- Pedido de registro → confirme com "✅ Registrado: [título]"
-- Pergunta sobre vagas → responda com o que sabe ou diga que não tem acesso em tempo real
-- Pedido impossível → explique e sugira alternativa"""
+}"""
 
 
 def claude(mensagem):
@@ -77,22 +82,21 @@ def claude(mensagem):
         data=json.dumps(payload).encode(),
         headers=headers, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        resp = json.loads(r.read())
-        return resp["content"][0]["text"]
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())["content"][0]["text"]
 
 
 def notion_criar_nota(titulo, conteudo, tipo="insight"):
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-    }
     etapa_map = {
         "insight": "E1 · Diagnóstico",
         "ideia": "E2 · Posicionamento",
         "vaga": "E4 · Radar e Fit",
         "outreach": "E5 · Outreach",
+    }
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
     }
     payload = {
         "parent": {"database_id": NOTION_BASES["sessoes"]},
@@ -113,10 +117,7 @@ def notion_criar_nota(titulo, conteudo, tipo="insight"):
 
 
 def zapi_enviar(telefone, mensagem):
-    headers = {
-        "Content-Type": "application/json",
-        "Client-Token": ZAPI_CLIENT_TOKEN,
-    }
+    headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": telefone, "message": mensagem}
     req = urllib.request.Request(
         f"{ZAPI_BASE}/send-text",
@@ -125,18 +126,15 @@ def zapi_enviar(telefone, mensagem):
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
+            result = json.loads(r.read())
+            print(f"✅ Enviado: {result.get('messageId','?')}")
+            return result
     except Exception as e:
-        print(f"Erro Z-API envio: {e}")
+        print(f"❌ Erro Z-API envio: {e}")
         return None
 
 
 def extrair_mensagem(data):
-    """
-    Extrai o texto e tipo da mensagem do payload Z-API.
-    Retorna (texto, tipo) onde tipo pode ser: texto, audio, imagem, documento, desconhecido
-    """
-    # Mensagem de texto
     texto = (
         data.get("text", {}).get("message") or
         data.get("body") or
@@ -144,34 +142,25 @@ def extrair_mensagem(data):
     )
     if texto:
         return texto.strip(), "texto"
-
-    # Mensagem de áudio/voz
     if data.get("audio") or data.get("type") in ("AudioMessage", "PTT"):
         duracao = data.get("audio", {}).get("duration", "?")
-        return f"[ÁUDIO de {duracao}s — transcrição não disponível]", "audio"
-
-    # Imagem
-    if data.get("image") or data.get("type") == "ImageMessage":
+        return f"[ÁUDIO {duracao}s]", "audio"
+    if data.get("image"):
         caption = data.get("image", {}).get("caption", "")
         return f"[IMAGEM{': ' + caption if caption else ''}]", "imagem"
-
-    # Documento
-    if data.get("document") or data.get("type") == "DocumentMessage":
+    if data.get("document"):
         nome = data.get("document", {}).get("fileName", "arquivo")
         return f"[DOCUMENTO: {nome}]", "documento"
-
-    # Sticker / reação / outros
     return "", "desconhecido"
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    telefone = "desconhecido"
+    telefone = ""
     try:
         data = request.get_json(force=True)
-        print(f"Webhook recebido: {json.dumps(data)[:300]}")
+        print(f"📩 Recebido: {json.dumps(data)[:300]}")
 
-        # Ignorar mensagens enviadas pelo próprio bot
         if data.get("fromMe"):
             return jsonify({"status": "ignored"}), 200
 
@@ -180,87 +169,80 @@ def webhook():
             return jsonify({"status": "no_phone"}), 200
 
         texto, tipo = extrair_mensagem(data)
-        print(f"Tipo: {tipo} | De: {telefone} | Texto: {texto[:100]}")
+        print(f"Tipo={tipo} | De={telefone} | '{texto[:80]}'")
 
-        # ── Mensagem de áudio ────────────────────────────────────────────
+        # ── Áudio ────────────────────────────────────────────────────────
         if tipo == "audio":
-            resposta = (
-                "🎙️ Recebi seu áudio!\n\n"
-                "Ainda não consigo processar mensagens de voz diretamente. "
-                "Me manda em *texto* e executo na hora — registrar nota, consultar vagas, o que precisar."
+            zapi_enviar(telefone,
+                "🎙️ *Recebi seu áudio!*\n\n"
+                "Ainda não processo voz diretamente. "
+                "Me manda em texto e executo na hora.\n\n"
+                "_O que você queria registrar ou perguntar?_"
             )
-            zapi_enviar(telefone, resposta)
-            return jsonify({"status": "ok", "acao": "audio_nao_suportado"}), 200
+            return jsonify({"status": "ok", "acao": "audio_sem_suporte"}), 200
 
         # ── Imagem ───────────────────────────────────────────────────────
         if tipo == "imagem":
-            resposta = (
-                "🖼️ Recebi sua imagem!\n\n"
-                "Ainda não processo imagens. Se quiser registrar algo sobre ela, "
-                "me descreve em texto."
+            zapi_enviar(telefone,
+                "🖼️ *Recebi sua imagem!*\n\n"
+                "Ainda não processo imagens. "
+                "Descreve em texto o que quer registrar?\n\n"
+                "_Me manda o contexto e registro no Notion._"
             )
-            zapi_enviar(telefone, resposta)
-            return jsonify({"status": "ok", "acao": "imagem_nao_suportada"}), 200
+            return jsonify({"status": "ok", "acao": "imagem_sem_suporte"}), 200
 
-        # ── Sem conteúdo processável ─────────────────────────────────────
+        # ── Sem conteúdo ─────────────────────────────────────────────────
         if not texto:
-            resposta = "Recebi sua mensagem, mas não consegui identificar o conteúdo. Tenta mandar em texto! 👍"
-            zapi_enviar(telefone, resposta)
+            zapi_enviar(telefone,
+                "Recebi sua mensagem mas não identifiquei o conteúdo. 🤔\n\n"
+                "_Tenta mandar em texto — o que posso fazer por você?_"
+            )
             return jsonify({"status": "ok", "acao": "sem_conteudo"}), 200
 
-        # ── Texto: processa com Claude ───────────────────────────────────
+        # ── Texto: Claude ────────────────────────────────────────────────
         resposta_raw = claude(texto)
-        print(f"Claude respondeu: {resposta_raw[:200]}")
+        print(f"🤖 Claude: {resposta_raw[:200]}")
 
         try:
-            resposta_json = json.loads(resposta_raw)
+            rj = json.loads(resposta_raw)
         except Exception:
-            resposta_json = {"resposta": resposta_raw, "acao": "nenhuma", "dados": {}}
+            rj = {"resposta": resposta_raw, "acao": "nenhuma", "dados": {}}
 
-        resposta_texto = resposta_json.get("resposta", resposta_raw)
-        acao = resposta_json.get("acao", "nenhuma")
-        dados = resposta_json.get("dados", {})
+        resposta_texto = rj.get("resposta", resposta_raw)
+        acao = rj.get("acao", "nenhuma")
+        dados = rj.get("dados", {})
 
-        # ── Executar ação no Notion ──────────────────────────────────────
+        # ── Ação Notion ──────────────────────────────────────────────────
         if acao == "registrar_nota":
             titulo = dados.get("titulo", texto[:60])
             conteudo = dados.get("conteudo", texto)
             tipo_nota = dados.get("tipo", "insight")
             try:
-                url_notion = notion_criar_nota(titulo, conteudo, tipo_nota)
-                if url_notion:
-                    resposta_texto += f"\n\n✅ *Registrado no Notion:* _{titulo}_"
-                else:
-                    resposta_texto += "\n\n⚠️ Tentei registrar no Notion mas não recebi confirmação."
+                url = notion_criar_nota(titulo, conteudo, tipo_nota)
+                sufixo = f"\n\n✅ *Registrado no Notion:* _{titulo}_" if url else \
+                         "\n\n⚠️ _Processado, mas não recebi confirmação do Notion._"
+                resposta_texto += sufixo
             except Exception as e:
                 print(f"Erro Notion: {e}")
-                resposta_texto += "\n\n⚠️ Não consegui registrar no Notion agora. Tenta novamente?"
+                resposta_texto += "\n\n❌ _Não consegui registrar no Notion agora. Tenta novamente?_"
 
-        # ── Enviar resposta ──────────────────────────────────────────────
-        resultado_envio = zapi_enviar(telefone, resposta_texto)
-        if resultado_envio:
-            print(f"Resposta enviada: {resultado_envio.get('messageId','?')}")
-        else:
-            print("Falha ao enviar resposta via Z-API")
-
+        zapi_enviar(telefone, resposta_texto)
         return jsonify({"status": "ok", "acao": acao}), 200
 
     except Exception as e:
-        print(f"Erro geral no webhook: {e}")
-        # Tentar enviar mensagem de erro para o usuário
-        if telefone and telefone != "desconhecido":
-            try:
-                zapi_enviar(telefone, "❌ Ocorreu um erro interno. Tenta novamente em instantes.")
-            except Exception:
-                pass
+        print(f"❌ Erro geral: {e}")
+        if telefone:
+            zapi_enviar(telefone,
+                "❌ Ocorreu um erro interno.\n\n"
+                "_Tenta novamente em instantes ou reformula a mensagem._"
+            )
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "Career OS Agent online ⚡", "version": "3.0"}), 200
+    return jsonify({"status": "Career OS Agent online ⚡", "version": "4.0"}), 200
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
