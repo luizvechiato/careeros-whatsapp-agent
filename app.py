@@ -1,7 +1,7 @@
 """
-Career OS — Agente WhatsApp v5.4
+Career OS — Agente WhatsApp v5.6
 Webhook Z-API → Claude → Make → Asana/Notion/Calendar
-Novidade v5.4: timestamp ISO 8601 em todas as ações (recebido_em)
+v5.4: timestamp BR | v5.5: retry audio | v5.6: ACK imediato + conversa natural + confirmação de resultado
 """
 
 from flask import Flask, request, jsonify
@@ -32,30 +32,31 @@ ZAPI_BASE = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
 sent_message_ids = set()
 
 # ── System Prompt ──────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Você é o agente de IA do Career OS — sistema de recolocação executiva de Luiz Vechiato.
+SYSTEM_PROMPT = """Você é o assistente de IA do Career OS, integrado ao WhatsApp de Luiz Vechiato.
 
-Recebe mensagens de voz ou texto via WhatsApp e classifica a intenção para execução automática.
+Você é inteligente, direto e conversacional — funciona como uma extensão natural do Claude no terminal, mas via WhatsApp. Responde tanto a comandos de ação quanto a conversas livres, perguntas e bate-papo.
 
 INTENÇÕES POSSÍVEIS:
-- tarefa → criar no Asana via Make
-- agenda → criar no Google Calendar via Make
-- nota → registrar no Notion via Make
-- email → rascunho no Outlook via Make
-- planilha → atualizar Excel via Make
-- pergunta → responder diretamente no WhatsApp
+- tarefa → criar no Asana (ex: "lembra de ligar para o João", "tarefa: revisar proposta")
+- agenda → criar no Google Calendar (ex: "reunião amanhã às 15h com Pedro")
+- nota → registrar no Notion (ex: "anota aí: insight sobre posicionamento")
+- email → rascunho no Outlook (ex: "escreve um email para a Ana sobre a vaga")
+- planilha → atualizar Excel (ex: "adiciona na planilha: R$500 de consultoria")
+- conversa → responder diretamente, sem ação externa (qualquer outra coisa)
 
-INSTRUÇÕES:
-1. Identifique a intenção principal da mensagem
-2. Extraia título e detalhes relevantes
-3. Responda confirmando o que será feito (máx 2 linhas)
-4. Use português brasileiro, tom direto
+INSTRUÇÕES GERAIS:
+1. Para ações (tarefa/agenda/nota/email/planilha): extraia título e detalhes. A resposta deve confirmar brevemente o que foi identificado.
+2. Para conversa, perguntas, bate-papo ou saudações: responda de forma natural, inteligente e útil — sem forçar classificação de ação. Seja o assistente que Luiz precisa.
+3. Se a mensagem for ambígua, pergunte para confirmar antes de executar.
+4. Use português brasileiro, tom direto e humano.
+5. Respostas de WhatsApp devem ser curtas (máx 3 linhas), exceto quando Luiz pedir explicação.
 
 RESPONDA SEMPRE COM JSON VÁLIDO:
 {
-  "resposta": "texto curto para o WhatsApp",
-  "tipo": "tarefa | agenda | nota | email | planilha | pergunta",
-  "titulo": "título da ação extraído da mensagem",
-  "detalhes": "informações complementares"
+  "resposta": "texto para enviar no WhatsApp",
+  "tipo": "tarefa | agenda | nota | email | planilha | conversa",
+  "titulo": "título extraído (vazio se conversa)",
+  "detalhes": "informações complementares (vazio se conversa)"
 }"""
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -134,13 +135,12 @@ def groq_transcrever(audio_url):
 
 
 def make_enviar(tipo, titulo, detalhes, recebido_em):
-    """Envia payload ao Make webhook com timestamp."""
     payload = {
         "text": titulo,
         "tipo": tipo,
         "detalhes": detalhes,
         "fonte": "whatsapp",
-        "recebido_em": recebido_em,            # DD/MM/YYYY HH:MM:SS (Brasília)
+        "recebido_em": recebido_em,
     }
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
@@ -175,33 +175,28 @@ def zapi_enviar(telefone, mensagem):
         print(f"Erro Z-API enviar: {e}")
         return None
 
-
 # ── Webhook principal ──────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    recebido_em = agora_br()   # captura imediato ao chegar no servidor
+    recebido_em = agora_br()
 
     try:
         data = request.get_json(force=True)
         print(f"[{recebido_em}] Webhook: {json.dumps(data)[:300]}")
 
-        # Anti-loop: ignorar mensagens enviadas pelo próprio bot
         msg_id = data.get("messageId") or data.get("id")
         if msg_id and msg_id in sent_message_ids:
             return jsonify({"status": "ignored_own"}), 200
         if data.get("fromMe") and not data.get("phone"):
             return jsonify({"status": "ignored_fromMe"}), 200
 
-        # Extrair telefone
         telefone = data.get("phone") or data.get("from", "").replace("@c.us", "")
         if not telefone:
             return jsonify({"status": "no_phone"}), 200
 
-        # Extrair texto (pode ser mensagem de texto ou áudio transcrito)
         texto = ""
 
-        # Verificar se é áudio
         audio_url = (
             data.get("audio", {}).get("audioUrl") or
             data.get("audio", {}).get("url") or
@@ -229,30 +224,47 @@ def webhook():
 
         print(f"[{recebido_em}] De {telefone}: {texto[:100]}")
 
-        # Processar com Claude
+        zapi_enviar(telefone, f"⏳ Recebi às {recebido_em[11:]}. Processando...")
+
         resposta_raw = claude(texto)
 
         try:
             r = json.loads(resposta_raw)
         except:
-            r = {"resposta": resposta_raw, "tipo": "pergunta", "titulo": texto[:60], "detalhes": ""}
+            r = {"resposta": resposta_raw, "tipo": "conversa", "titulo": "", "detalhes": ""}
 
         resposta_texto = r.get("resposta", resposta_raw)
-        tipo           = r.get("tipo", "pergunta")
+        tipo           = r.get("tipo", "conversa")
         titulo         = r.get("titulo", texto[:60])
         detalhes       = r.get("detalhes", "")
 
-        # Enviar ao Make se for ação (não pergunta simples)
-        if tipo != "pergunta" and MAKE_WEBHOOK_URL:
+        DESTINOS = {
+            "tarefa":    "Asana",
+            "agenda":    "Google Calendar",
+            "nota":      "Notion",
+            "email":     "Outlook",
+            "planilha":  "Excel",
+        }
+
+        if tipo in DESTINOS and MAKE_WEBHOOK_URL:
+            destino = DESTINOS[tipo]
             try:
                 make_enviar(tipo, titulo, detalhes, recebido_em)
-                print(f"[{recebido_em}] Make acionado: tipo={tipo}, titulo={titulo}")
+                print(f"[{recebido_em}] Make OK: tipo={tipo}, titulo={titulo}")
+                zapi_enviar(telefone,
+                    f"✅ {tipo.capitalize()} registrada no {destino}!\n"
+                    f"📌 {titulo}\n"
+                    f"🕐 {recebido_em}"
+                )
             except Exception as e:
                 print(f"[{recebido_em}] Erro Make: {e}")
-                resposta_texto += "\n⚠️ Ação registrada localmente (Make indisponível)."
-
-        # Responder no WhatsApp
-        zapi_enviar(telefone, resposta_texto)
+                zapi_enviar(telefone,
+                    f"⚠️ Não consegui enviar para o {destino}.\n"
+                    f"O que pedi: {titulo}\n"
+                    f"Tente novamente ou acesse o {destino} diretamente."
+                )
+        else:
+            zapi_enviar(telefone, resposta_texto)
 
         return jsonify({"status": "ok", "tipo": tipo, "recebido_em": recebido_em}), 200
 
@@ -264,15 +276,14 @@ def webhook():
 # ── Self-ping anti-sleep ───────────────────────────────────────────────────
 
 def self_ping():
-    """Pinga o próprio endpoint a cada 4 minutos para evitar cold start."""
-    time.sleep(30)  # aguarda app subir
+    time.sleep(30)
     while True:
         try:
             urllib.request.urlopen(f"{RENDER_URL}/health", timeout=10)
             print(f"[{agora_br()}] Self-ping OK")
         except Exception as e:
             print(f"[{agora_br()}] Self-ping erro: {e}")
-        time.sleep(240)  # 4 minutos
+        time.sleep(240)
 
 threading.Thread(target=self_ping, daemon=True).start()
 
@@ -281,11 +292,11 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "5.4", "ts": agora_br()}), 200
+    return jsonify({"status": "ok", "version": "5.6", "ts": agora_br()}), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.4"}), 200
+    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.6"}), 200
 
 
 if __name__ == "__main__":
