@@ -1,14 +1,17 @@
 """
-Career OS — Agente WhatsApp v4
+Career OS — Agente WhatsApp v4.1
 Webhook que recebe mensagens do Z-API, processa com Claude e SEMPRE responde.
 Regras: feedback obrigatório + CTA em toda resposta.
 Suporta: texto, áudio/voz, imagem (com fallback).
+v4.1: self-ping thread anti-sleep (sem serviço externo, zero custo)
 """
 
 from flask import Flask, request, jsonify
 import urllib.request
 import json
 import os
+import threading
+import time
 
 app = Flask(__name__)
 
@@ -18,6 +21,9 @@ ZAPI_INSTANCE      = os.environ["ZAPI_INSTANCE"]
 ZAPI_TOKEN         = os.environ["ZAPI_TOKEN"]
 ZAPI_CLIENT_TOKEN  = os.environ["ZAPI_CLIENT_TOKEN"]
 ZAPI_BASE          = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
+
+RENDER_URL = os.environ.get("RENDER_URL", "https://careeros-whatsapp-agent.onrender.com")
+PING_INTERVAL = 4 * 60  # 4 minutos — Render dorme após 15min sem request
 
 NOTION_BASES = {
     "clientes":  "375e130d4df481b9bebbc1ffbb13ccbe",
@@ -65,6 +71,29 @@ FORMATO DE RESPOSTA (sempre JSON válido):
 }"""
 
 
+# ── Self-ping anti-sleep ─────────────────────────────────────────────────────
+
+def self_ping_loop():
+    """Pinga o próprio /health a cada 4 min para evitar sleep do Render free tier."""
+    # Espera 60s para o servidor subir antes do primeiro ping
+    time.sleep(60)
+    while True:
+        try:
+            req = urllib.request.Request(f"{RENDER_URL}/health")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                print(f"🔁 Self-ping OK — {r.status}")
+        except Exception as e:
+            print(f"⚠️  Self-ping falhou: {e}")
+        time.sleep(PING_INTERVAL)
+
+def iniciar_self_ping():
+    t = threading.Thread(target=self_ping_loop, daemon=True)
+    t.start()
+    print(f"🔁 Self-ping iniciado (intervalo: {PING_INTERVAL//60}min)")
+
+
+# ── Claude ───────────────────────────────────────────────────────────────────
+
 def claude(mensagem):
     headers = {
         "x-api-key": ANTHROPIC_KEY,
@@ -85,6 +114,8 @@ def claude(mensagem):
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read())["content"][0]["text"]
 
+
+# ── Notion ───────────────────────────────────────────────────────────────────
 
 def notion_criar_nota(titulo, conteudo, tipo="insight"):
     etapa_map = {
@@ -116,6 +147,8 @@ def notion_criar_nota(titulo, conteudo, tipo="insight"):
         return json.loads(r.read()).get("url", "")
 
 
+# ── Z-API ────────────────────────────────────────────────────────────────────
+
 def zapi_enviar(telefone, mensagem):
     headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
     payload = {"phone": telefone, "message": mensagem}
@@ -133,6 +166,8 @@ def zapi_enviar(telefone, mensagem):
         print(f"❌ Erro Z-API envio: {e}")
         return None
 
+
+# ── Parsing de mensagem ──────────────────────────────────────────────────────
 
 def extrair_mensagem(data):
     texto = (
@@ -153,6 +188,8 @@ def extrair_mensagem(data):
         return f"[DOCUMENTO: {nome}]", "documento"
     return "", "desconhecido"
 
+
+# ── Rotas ────────────────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -241,8 +278,12 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "Career OS Agent online ⚡", "version": "4.0"}), 200
+    return jsonify({"status": "Career OS Agent online ⚡", "version": "4.1"}), 200
 
+
+# ── Startup ──────────────────────────────────────────────────────────────────
+
+iniciar_self_ping()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
