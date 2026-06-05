@@ -1,6 +1,6 @@
 """
 Career OS — Agente WhatsApp v5.1
-v5.2: fix fromMe (número próprio), anti-loop por messageId + fallback catch-all (sempre responde) + fix payload Z-API áudio
+v5.3: Groq Whisper transcrição + fix fromMe (número próprio), anti-loop por messageId + fallback catch-all (sempre responde) + fix payload Z-API áudio
 """
 
 from flask import Flask, request, jsonify
@@ -18,6 +18,7 @@ ZAPI_INSTANCE     = os.environ["ZAPI_INSTANCE"]
 ZAPI_TOKEN        = os.environ["ZAPI_TOKEN"]
 ZAPI_CLIENT_TOKEN = os.environ["ZAPI_CLIENT_TOKEN"]
 ZAPI_BASE         = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 MAKE_WEBHOOK_URL  = os.environ.get("MAKE_WEBHOOK_URL", "https://hook.us2.make.com/mpcr21sy4xdfxuw454x70e86ese0ppxt")
 RENDER_URL        = os.environ.get("RENDER_URL", "https://careeros-whatsapp-agent.onrender.com")
 PING_INTERVAL     = 4 * 60
@@ -79,20 +80,60 @@ def zapi_enviar(telefone, mensagem):
         print(f"❌ Erro envio: {e}")
 
 
-def zapi_transcrever(audio_url):
-    headers = {"Content-Type": "application/json", "Client-Token": ZAPI_CLIENT_TOKEN}
-    req = urllib.request.Request(
-        f"{ZAPI_BASE}/audio-to-text",
-        data=json.dumps({"url": audio_url}).encode(),
-        headers=headers, method="POST"
-    )
+def groq_transcrever(audio_url):
+    """Baixa o áudio e transcreve via Groq Whisper (gratuito)."""
+    if not GROQ_API_KEY:
+        print("⚠️ GROQ_API_KEY não configurada")
+        return ""
     try:
+        # Baixar áudio
+        audio_data = urllib.request.urlopen(audio_url, timeout=15).read()
+        print(f"🎙️ Áudio baixado: {len(audio_data)} bytes")
+
+        # Montar multipart/form-data manualmente
+        boundary = "----CareerOSBoundary"
+        body = (
+            f"--{boundary}
+"
+            f'Content-Disposition: form-data; name="model"
+
+'
+            f"whisper-large-v3-turbo
+"
+            f"--{boundary}
+"
+            f'Content-Disposition: form-data; name="language"
+
+'
+            f"pt
+"
+            f"--{boundary}
+"
+            f'Content-Disposition: form-data; name="file"; filename="audio.ogg"
+'
+            f"Content-Type: audio/ogg
+
+"
+        ).encode() + audio_data + f"
+--{boundary}--
+".encode()
+
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST"
+        )
         with urllib.request.urlopen(req, timeout=30) as r:
             result = json.loads(r.read())
-            print(f"🎙️ Transcrição result: {result}")
-            return result.get("text") or result.get("transcription") or ""
+            text = result.get("text", "").strip()
+            print(f"🎙️ Transcrição Groq: '{text[:80]}'")
+            return text
     except Exception as e:
-        print(f"❌ Transcrição: {e}")
+        print(f"❌ Groq transcrição: {e}")
         return ""
 
 
@@ -215,7 +256,7 @@ def webhook():
 
             if audio_url:
                 zapi_enviar(telefone, "🎙️ _Transcrevendo..._")
-                transcricao = zapi_transcrever(audio_url)
+                transcricao = groq_transcrever(audio_url)
                 if transcricao:
                     tipo = "texto"
                     # Processar como texto abaixo
@@ -310,7 +351,7 @@ def webhook():
 def debug():
     """Retorna os últimos payloads recebidos — para diagnóstico."""
     return jsonify({
-        "version": "5.2",
+        "version": "5.3",
         "last_payloads_count": len(_last_payloads),
         "payloads": _last_payloads
     }), 200
@@ -320,7 +361,7 @@ def debug():
 def health():
     return jsonify({
         "status": "Career OS Agent online ⚡",
-        "version": "5.2",
+        "version": "5.3",
         "make_webhook": MAKE_WEBHOOK_URL[:50] + "..."
     }), 200
 
