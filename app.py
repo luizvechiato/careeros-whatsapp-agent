@@ -12,11 +12,12 @@ import os
 app = Flask(__name__)
 
 # ── Configurações (via environment variables) ─────────────────────────────
-ANTHROPIC_KEY  = os.environ["ANTHROPIC_KEY"]
-NOTION_TOKEN   = os.environ["NOTION_TOKEN"]
-ZAPI_INSTANCE  = os.environ["ZAPI_INSTANCE"]
-ZAPI_TOKEN     = os.environ["ZAPI_TOKEN"]
-ZAPI_BASE      = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
+ANTHROPIC_KEY      = os.environ["ANTHROPIC_KEY"]
+NOTION_TOKEN       = os.environ["NOTION_TOKEN"]
+ZAPI_INSTANCE      = os.environ["ZAPI_INSTANCE"]
+ZAPI_TOKEN         = os.environ["ZAPI_TOKEN"]
+ZAPI_CLIENT_TOKEN  = os.environ["ZAPI_CLIENT_TOKEN"]
+ZAPI_BASE          = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
 
 NOTION_BASES = {
     "clientes":  "375e130d4df481b9bebbc1ffbb13ccbe",
@@ -110,7 +111,7 @@ def notion_criar_nota(titulo, conteudo, tipo="insight"):
 def zapi_enviar(telefone, mensagem):
     headers = {
         "Content-Type": "application/json",
-        "client-token": ZAPI_TOKEN,
+        "Client-Token": ZAPI_CLIENT_TOKEN,
     }
     payload = {"phone": telefone, "message": mensagem}
     req = urllib.request.Request(
@@ -158,7 +159,6 @@ def webhook():
         acao = resposta_json.get("acao", "nenhuma")
         dados = resposta_json.get("dados", {})
 
-        url_notion = ""
         if acao == "registrar_nota":
             titulo = dados.get("titulo", texto[:50])
             conteudo = dados.get("conteudo", texto)
