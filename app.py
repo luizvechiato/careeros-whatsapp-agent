@@ -1,7 +1,7 @@
 """
-Career OS — Agente WhatsApp v5.8
+Career OS — Agente WhatsApp v5.9
 Webhook Z-API → Claude → Make → Asana/Notion/Calendar
-v5.8: inteligência de projetos, resolução de datas, criação automática, duplicidade
+v5.9: fix Groq 403 (User-Agent header para bypass Cloudflare WAF)
 """
 
 from flask import Flask, request, jsonify
@@ -135,7 +135,17 @@ def groq_transcrever(audio_url):
         raise Exception(f"Audio indisponível: {last_error}")
     boundary = "----CareerOSBoundary"
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n").encode() + audio_bytes + (f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}--\r\n").encode()
-    req = urllib.request.Request("https://api.groq.com/openai/v1/audio/transcriptions", data=body, headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "python-requests/2.31.0",
+            "Accept": "application/json"
+        },
+        method="POST"
+    )
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read()).get("text", "")
 
@@ -173,16 +183,16 @@ def webhook():
             print(f"[{recebido_em}] Audio: {audio_url[:80]}")
             try:
                 texto = groq_transcrever(audio_url)
-                print(f"[{recebido_em}] Transcrição: {texto[:100]}")
+                print(f"[{recebido_em}] Transcricao: {texto[:100]}")
             except Exception as e:
                 print(f"[{recebido_em}] Erro Groq: {e}")
-                zapi_enviar(telefone, "⚠️ Não consegui transcrever o áudio. Tente enviar como texto.")
+                zapi_enviar(telefone, "Nao consegui transcrever o audio. Tente enviar como texto.")
                 return jsonify({"status": "groq_error"}), 200
         else:
             texto = (data.get("text", {}).get("message") or data.get("body") or data.get("message") or "")
         if not texto: return jsonify({"status": "no_message"}), 200
         print(f"[{recebido_em}] De {telefone}: {texto[:100]}")
-        zapi_enviar(telefone, f"⏳ Recebi às {recebido_em[11:]}. Processando...")
+        zapi_enviar(telefone, f"Recebi as {recebido_em[11:]}. Processando...")
         resposta_raw = claude(texto)
         try:
             r = json.loads(resposta_raw)
@@ -202,30 +212,29 @@ def webhook():
             try:
                 adicionar_projeto_registry(novo_projeto)
                 make_enviar({"tipo": "criar_projeto", "text": novo_projeto, "detalhes": detalhes, "fonte": "whatsapp", "recebido_em": recebido_em})
-                zapi_enviar(telefone, f"🆕 Novo projeto registrado: *{novo_projeto}*\n📋 Adicionado ao Projects Registry no Notion.\n⚙️ Asana + Notion serão criados com o template de governança.")
+                zapi_enviar(telefone, f"Novo projeto registrado: {novo_projeto}")
             except Exception as e:
-                zapi_enviar(telefone, f"⚠️ Erro ao criar projeto '{novo_projeto}': {e}")
+                zapi_enviar(telefone, f"Erro ao criar projeto: {e}")
             return jsonify({"status": "ok", "tipo": tipo}), 200
         if tipo in ACOES - {"criar_projeto"} and not projetos and tipo not in {"ideia", "conversa"}:
             projetos_ativos = [n for n, i in get_projects().items() if i["status"] == "ativo"]
             opcoes = "\n".join([f"{i+1}. {p}" for i, p in enumerate(projetos_ativos)])
-            zapi_enviar(telefone, f"❓ Para qual projeto devo registrar?\n\n{opcoes}\n\nResponda com o número ou nome do projeto.")
+            zapi_enviar(telefone, f"Para qual projeto?\n\n{opcoes}\n\nResponda com o numero ou nome.")
             return jsonify({"status": "ok", "tipo": "aguardando_projeto"}), 200
         if tipo in ACOES and MAKE_WEBHOOK_URL:
-            projetos_alvo = projetos if projetos else ["Consultorias Estratégicas"]
+            projetos_alvo = projetos if projetos else ["Consultorias Estrategicas"]
             erros = []
             for proj in projetos_alvo:
                 try:
                     make_enviar({"tipo": tipo, "text": titulo, "detalhes": detalhes, "projeto": proj, "data_agenda": data_agenda, "participantes": participantes, "fonte": "whatsapp", "recebido_em": recebido_em})
-                    print(f"[{recebido_em}] Make OK: {tipo} → {proj}")
+                    print(f"[{recebido_em}] Make OK: {tipo} -> {proj}")
                 except Exception as e:
                     erros.append(proj)
             if not erros:
-                info = f"\n📅 {data_agenda}" if data_agenda else ""
-                info += f"\n👥 {', '.join(participantes)}" if participantes else ""
-                zapi_enviar(telefone, f"✅ *{tipo.capitalize()}* registrada!\n📌 {titulo}\n🗂️ {' + '.join(projetos_alvo)}{info}\n🕐 {recebido_em}")
+                info = f"\n{data_agenda}" if data_agenda else ""
+                zapi_enviar(telefone, f"Registrado! {titulo} em {' + '.join(projetos_alvo)}{info}")
             else:
-                zapi_enviar(telefone, f"⚠️ Falhou em: {', '.join(erros)}. Tente novamente.")
+                zapi_enviar(telefone, f"Falhou em: {', '.join(erros)}. Tente novamente.")
         else:
             zapi_enviar(telefone, resposta_texto)
         return jsonify({"status": "ok", "tipo": tipo, "recebido_em": recebido_em}), 200
@@ -244,11 +253,11 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "5.8", "ts": agora_br()}), 200
+    return jsonify({"status": "ok", "version": "5.9", "ts": agora_br()}), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.8"}), 200
+    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.9"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
