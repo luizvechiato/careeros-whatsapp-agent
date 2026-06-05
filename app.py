@@ -1,6 +1,6 @@
 """
 Career OS — Agente WhatsApp v5.1
-v5.1: debug endpoint + fallback catch-all (sempre responde) + fix payload Z-API áudio
+v5.2: fix fromMe (número próprio), anti-loop por messageId + fallback catch-all (sempre responde) + fix payload Z-API áudio
 """
 
 from flask import Flask, request, jsonify
@@ -24,6 +24,9 @@ PING_INTERVAL     = 4 * 60
 
 # Armazena últimos 5 payloads recebidos (para debug)
 _last_payloads = []
+
+# IDs de mensagens enviadas pelo agente (evita loop)
+_sent_message_ids = set()
 
 SYSTEM_PROMPT = """Você é o agente de IA do Career OS de Luiz Vechiato.
 
@@ -193,8 +196,10 @@ def webhook():
         if len(_last_payloads) > 5:
             _last_payloads.pop(0)
 
-        if data.get("fromMe"):
-            return jsonify({"status": "ignored"}), 200
+        # Ignorar mensagens enviadas pelo próprio agente (anti-loop)
+        msg_id = data.get("messageId") or data.get("id", {}).get("id") if isinstance(data.get("id"), dict) else data.get("id")
+        if msg_id and msg_id in _sent_message_ids:
+            return jsonify({"status": "ignored_own"}), 200
 
         telefone = data.get("phone") or data.get("from", "").replace("@c.us", "")
         if not telefone:
@@ -305,7 +310,7 @@ def webhook():
 def debug():
     """Retorna os últimos payloads recebidos — para diagnóstico."""
     return jsonify({
-        "version": "5.1",
+        "version": "5.2",
         "last_payloads_count": len(_last_payloads),
         "payloads": _last_payloads
     }), 200
@@ -315,7 +320,7 @@ def debug():
 def health():
     return jsonify({
         "status": "Career OS Agent online ⚡",
-        "version": "5.1",
+        "version": "5.2",
         "make_webhook": MAKE_WEBHOOK_URL[:50] + "..."
     }), 200
 
