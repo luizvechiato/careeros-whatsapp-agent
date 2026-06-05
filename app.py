@@ -83,57 +83,45 @@ def zapi_enviar(telefone, mensagem):
 def groq_transcrever(audio_url):
     """Baixa o áudio e transcreve via Groq Whisper (gratuito)."""
     if not GROQ_API_KEY:
-        print("⚠️ GROQ_API_KEY não configurada")
+        print("GROQ_API_KEY nao configurada")
         return ""
     try:
-        # Baixar áudio
         audio_data = urllib.request.urlopen(audio_url, timeout=15).read()
-        print(f"🎙️ Áudio baixado: {len(audio_data)} bytes")
+        print(f"Audio baixado: {len(audio_data)} bytes")
 
-        # Montar multipart/form-data manualmente
-        boundary = "----CareerOSBoundary"
+        boundary = "CareerOSBoundary"
+        CRLF = b"\r\n"
+        def field(name, value):
+            return (b"--" + boundary.encode() + CRLF +
+                    b"Content-Disposition: form-data; name=\"" + name.encode() + b"\"" + CRLF +
+                    CRLF + value.encode() + CRLF)
+
         body = (
-            f"--{boundary}
-"
-            f'Content-Disposition: form-data; name="model"
-
-'
-            f"whisper-large-v3-turbo
-"
-            f"--{boundary}
-"
-            f'Content-Disposition: form-data; name="language"
-
-'
-            f"pt
-"
-            f"--{boundary}
-"
-            f'Content-Disposition: form-data; name="file"; filename="audio.ogg"
-'
-            f"Content-Type: audio/ogg
-
-"
-        ).encode() + audio_data + f"
---{boundary}--
-".encode()
+            field("model", "whisper-large-v3-turbo") +
+            field("language", "pt") +
+            b"--" + boundary.encode() + CRLF +
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"" + CRLF +
+            b"Content-Type: audio/ogg" + CRLF +
+            CRLF + audio_data + CRLF +
+            b"--" + boundary.encode() + b"--" + CRLF
+        )
 
         req = urllib.request.Request(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             data=body,
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Authorization": "Bearer " + GROQ_API_KEY,
+                "Content-Type": "multipart/form-data; boundary=" + boundary,
             },
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=30) as r:
             result = json.loads(r.read())
             text = result.get("text", "").strip()
-            print(f"🎙️ Transcrição Groq: '{text[:80]}'")
+            print(f"Transcricao Groq: {text[:80]}")
             return text
     except Exception as e:
-        print(f"❌ Groq transcrição: {e}")
+        print(f"Groq erro: {e}")
         return ""
 
 
