@@ -89,10 +89,22 @@ def claude(mensagem):
 
 
 def groq_transcrever(audio_url):
-    """Baixa áudio da URL e transcreve com Groq Whisper."""
-    # Baixar áudio
-    with urllib.request.urlopen(audio_url, timeout=30) as r:
-        audio_bytes = r.read()
+    """Baixa áudio da URL e transcreve com Groq Whisper.
+    Tenta até 3 vezes com delay progressivo — a URL do Z-API pode demorar
+    alguns segundos para ficar disponível após o webhook chegar.
+    """
+    audio_bytes = None
+    for tentativa in range(3):
+        try:
+            with urllib.request.urlopen(audio_url, timeout=30) as r:
+                audio_bytes = r.read()
+            if audio_bytes:
+                break
+        except Exception as e:
+            print(f"Download áudio tentativa {tentativa+1}/3: {e}")
+            time.sleep(3 * (tentativa + 1))  # 3s, 6s, 9s
+    if not audio_bytes:
+        raise Exception(f"Áudio não disponível após 3 tentativas: {audio_url}")
 
     # Montar multipart/form-data manualmente
     boundary = "----CareerOSBoundary"
