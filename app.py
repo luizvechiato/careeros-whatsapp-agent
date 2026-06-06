@@ -1,7 +1,7 @@
 """
-Career OS â Agente WhatsApp v5.11
+Career OS â Agente WhatsApp v5.12
 Webhook Z-API â Claude â Make â Asana/Notion/Calendar
-v5.11: busca web (wttr.in + DDG + Serper) + prompt geral-purpose + dedup webhooks
+v5.12: pending_context por telefone (memÃ³ria de sessÃ£o para seleÃ§Ã£o de projeto)
 """
 
 from flask import Flask, request, jsonify
@@ -31,6 +31,7 @@ ZAPI_BASE = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
 PROJECTS_REGISTRY_DB = "376e130d4df4810b9d48df2644609585"
 sent_message_ids = set()
 processed_message_ids = set()  # dedup incoming webhooks duplicados
+pending_context = {}  # {phone: {tipo, titulo, detalhes, data_agenda, participantes, ts}} memÃ³ria de sessÃ£o
 _projects_cache = {}
 _projects_cache_ts = 0
 
@@ -328,6 +329,23 @@ def groq_transcrever(audio_url):
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read()).get("text", "")
 
+def resolver_projeto(texto):
+    """Tenta identificar projeto a partir da resposta do usuÃ¡rio (nÃºmero ou nome/alias)."""
+    projetos_ativos = [(n, i) for n, i in get_projects().items() if i["status"] == "ativo"]
+    texto_lower = texto.lower().strip()
+    # Tenta seleÃ§Ã£o numÃ©rica: "3", "opÃ§Ã£o 3", "nÃºmero 3", "terceiro"
+    nums = re.findall(r'\b(\d+)\b', texto_lower)
+    if nums:
+        idx = int(nums[0]) - 1
+        if 0 <= idx < len(projetos_ativos):
+            return projetos_ativos[idx][0]
+    # Tenta match por nome ou alias
+    for nome, info in projetos_ativos:
+        for alias in info.get("aliases", []):
+            if alias and len(alias) >= 3 and (alias in texto_lower or texto_lower in alias):
+                return nome
+    return None
+
 def make_enviar(payload):
     req = urllib.request.Request(MAKE_WEBHOOK_URL, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=30) as r: return r.read()
@@ -388,6 +406,46 @@ def webhook():
         if not texto: return jsonify({"status": "no_message"}), 200
 
         print(f"[{recebido_em}] De {telefone}: {texto[:100]}")
+
+        # ââ PENDING CONTEXT: verificar se usuÃ¡rio estÃ¡ respondendo seleÃ§Ã£o de projeto ââ
+        if telefone in pending_context:
+            pending = pending_context[telefone]
+            pending_age = time.time() - pending.get("ts", 0)
+            if pending_age < 600:  # TTL 10 minutos
+                projeto_selecionado = resolver_projeto(texto)
+                if projeto_selecionado:
+                    del pending_context[telefone]
+                    tipo = pending["tipo"]
+                    titulo = pending["titulo"]
+                    detalhes = pending["detalhes"]
+                    data_agenda = pending["data_agenda"]
+                    participantes = pending["participantes"]
+                    projetos_alvo = [projeto_selecionado]
+                    zapi_enviar(telefone, f"Recebi as {recebido_em[11:]}. Processando...")
+                    erros = []
+                    if MAKE_WEBHOOK_URL:
+                        for proj in projetos_alvo:
+                            try:
+                                make_enviar({"tipo": tipo, "text": titulo, "detalhes": detalhes, "projeto": proj, "data_agenda": data_agenda, "participantes": participantes, "fonte": "whatsapp", "recebido_em": recebido_em})
+                                print(f"[{recebido_em}] Make OK (pending): {tipo} -> {proj}")
+                            except Exception as e:
+                                erros.append(proj)
+                    if not erros:
+                        info = f"\nData: {data_agenda}" if data_agenda else ""
+                        info += f"\nParticipantes: {{', '.join(participantes)}" if participantes else ""
+                        zapi_enviar(telefone, f"{tipo.capitalize()} registrada!\n{titulo}\nProjeto: {projeto_selecionado}{info}\n{recebido_em}")
+                    else:
+                        zapi_enviar(telefone, f"Falhou em: {', '.join(erros)}. Tente novamente.")
+                    return jsonify({"status": "ok", "tipo": tipo, "recebido_em": recebido_em}), 200
+                else:
+                    # NÃ£o conseguiu identificar o projeto â re-pergunta
+                    projetos_ativos = [n for n, i in get_projects().items() if i["status"] == "ativo"]
+                    opcoes = "\n".join([f"{i+1}. {p}" for i, p in enumerate(projetos_ativos)])
+                    zapi_enviar(telefone, f"NÃ£o identifiquei o projeto. Responda com o nÃºmero ou nome:\n\n{opcoes}")
+                    return jsonify({"status": "ok", "tipo": "aguardando_projeto"}), 200
+            else:
+                del pending_context[telefone]  # expirado, processa normalmente
+
         zapi_enviar(telefone, f"Recebi as {recebido_em[11:]}. Processando...")
         resposta_raw = claude(texto)
         print(f"[{recebido_em}] Claude raw: {resposta_raw[:300]}")
@@ -417,7 +475,12 @@ def webhook():
         if tipo in ACOES - {"criar_projeto"} and not projetos and tipo not in {"ideia", "conversa"}:
             projetos_ativos = [n for n, i in get_projects().items() if i["status"] == "ativo"]
             opcoes = "\n".join([f"{i+1}. {p}" for i, p in enumerate(projetos_ativos)])
-            zapi_enviar(telefone, f"Para qual projeto devo registrar?\n\n{opcoes}\n\nResponda com o numero ou nome do projeto.")
+            # Salva contexto para resposta seguinte
+            pending_context[telefone] = {
+                "tipo": tipo, "titulo": titulo, "detalhes": detalhes,
+                "data_agenda": data_agenda, "participantes": participantes, "ts": time.time()
+            }
+            zapi_enviar(telefone, f"Para qual projeto devo registrar?\n\n{opcoes}\n\nResponda com o nÃºmero ou nome.")
             return jsonify({"status": "ok", "tipo": "aguardando_projeto"}), 200
         if tipo in ACOES and MAKE_WEBHOOK_URL:
             projetos_alvo = projetos if projetos else ["Consultorias EstratÃ©gicas"]
@@ -431,9 +494,9 @@ def webhook():
             if not erros:
                 info = f"\nData: {data_agenda}" if data_agenda else ""
                 info += f"\nParticipantes: {', '.join(participantes)}" if participantes else ""
-                zapi_enviar(telefone, f"{tipo.capitalize()} registrada!\n{titulo}\nProjeto: {' + '.join(projetos_alvo)}{info}\n{recebido_em}")
+                zapi_enviar(telefone, f"{tipo.capitalize()} registrada!\n{titulo}\nProjeto: {_ + '.join(projetos_alvo)}{info}\n{recebido_em}")
             else:
-                zapi_enviar(telefone, f"Falhou em: {', '.join(erros)}. Tente novamente.")
+                zapi_enviar(telefone, f"Falhou em: {_ + '.join(erros)}. Tente novamente.")
         else:
             zapi_enviar(telefone, resposta_texto)
         return jsonify({"status": "ok", "tipo": tipo, "recebido_em": recebido_em}), 200
@@ -452,11 +515,11 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "5.11", "ts": agora_br(), "serper": bool(SERPER_API_KEY)}), 200
+    return jsonify({"status": "ok", "version": "5.12", "ts": agora_br(), "serper": bool(SERPER_API_KEY)}), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.11"}), 200
+    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.12"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
