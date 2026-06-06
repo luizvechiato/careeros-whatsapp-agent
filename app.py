@@ -1,7 +1,7 @@
 """
 Career OS — Agente WhatsApp v5.9
 Webhook Z-API → Claude → Make → Asana/Notion/Calendar
-v5.9: fix Groq 403 (User-Agent header para bypass Cloudflare WAF)
+v5.9: fix KeyError SYSTEM_PROMPT.format + User-Agent Groq WAF bypass
 """
 
 from flask import Flask, request, jsonify
@@ -61,7 +61,7 @@ def adicionar_projeto_registry(nome, aliases_extra="", descricao=""):
     global _projects_cache_ts
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
-    payload = {"parent": {"database_id": PROJECTS_REGISTRY_DB}, "properties": {"Nome Oficial": {"title": [{"text": {"content": nome}}]}, "Aliases": {"rich_text": [{"text": {"content": aliases_extra or nome.lower()}}]}, "Status": {"select": {"name": "ideia"}}, "Tipo": {"select": {"name": "projeto"}}, "Descrição": {"rich_text": [{"text": {"content": descricao or f"Criado via WhatsApp"}}]}, "Criado em": {"date": {"start": today}}}}
+    payload = {"parent": {"database_id": PROJECTS_REGISTRY_DB}, "properties": {"Nome Oficial": {"title": [{"text": {"content": nome}}]}, "Aliases": {"rich_text": [{"text": {"content": aliases_extra or nome.lower()}}]}, "Status": {"select": {"name": "ideia"}}, "Tipo": {"select": {"name": "projeto"}}, "Descricao": {"rich_text": [{"text": {"content": descricao or f"Criado via WhatsApp"}}]}, "Criado em": {"date": {"start": today}}}}
     req = urllib.request.Request("https://api.notion.com/v1/pages", data=json.dumps(payload).encode(), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         result = json.loads(r.read())
@@ -75,37 +75,37 @@ def hoje_br():
 def amanha_br():
     return (datetime.now(timezone.utc) - timedelta(hours=3) + timedelta(days=1)).strftime("%d/%m/%Y")
 
-SYSTEM_PROMPT = """Você é o assistente de IA do Career OS, integrado ao WhatsApp de Luiz Vechiato.
-Você é inteligente, direto e conversacional. Gerencia projetos, tarefas, agendas, notas e ideias.
+SYSTEM_PROMPT = """Voce e o assistente de IA do Career OS, integrado ao WhatsApp de Luiz Vechiato.
+Voce e inteligente, direto e conversacional. Gerencia projetos, tarefas, agendas, notas e ideias.
 
 PROJETOS CONHECIDOS:
 {projetos_lista}
 
-TIPOS DE AÇÃO:
-- tarefa → criar no Asana do projeto
-- agenda → criar no Google Calendar (com data, hora e participantes)
-- nota → registrar no Notion do projeto
-- ideia → registrar como Ideia no hub Consultorias Estratégicas
-- criar_projeto → criar novo projeto no Asana + Notion com template de governança
-- conversa → responder diretamente
+TIPOS DE ACAO:
+- tarefa -> criar no Asana do projeto
+- agenda -> criar no Google Calendar (com data, hora e participantes)
+- nota -> registrar no Notion do projeto
+- ideia -> registrar como Ideia no hub Consultorias Estrategicas
+- criar_projeto -> criar novo projeto no Asana + Notion com template de governanca
+- conversa -> responder diretamente
 
 REGRAS DE PROJETO:
 1. Identifique o projeto pelo nome ou alias
-2. Se ação requer projeto e nenhum identificado, defina projetos como [] (sistema vai perguntar)
-3. Uma ação pode ter múltiplos projetos: ["Projeto A", "Projeto B"] — cria em duplicidade
+2. Se acao requer projeto e nenhum identificado, defina projetos como [] (sistema vai perguntar)
+3. Uma acao pode ter multiplos projetos: ["Projeto A", "Projeto B"] - cria em duplicidade
 4. Se nome de projeto desconhecido for mencionado, use tipo=criar_projeto
-5. Ideias sem projeto específico → tipo=ideia, projetos=["Consultorias Estratégicas"]
+5. Ideias sem projeto especifico -> tipo=ideia, projetos=["Consultorias Estrategicas"]
 
-RESOLUÇÃO DE DATAS (hoje é {hoje}, amanhã é {amanha}):
+RESOLUCAO DE DATAS (hoje e {hoje}, amanha e {amanha}):
 - Resolva datas relativas para DD/MM/YYYY HH:MM
-- Se hora não mencionada, use null
+- Se hora nao mencionada, use null
 
-RESPONDA SEMPRE COM JSON:
-{"resposta": "texto WhatsApp", "tipo": "tarefa|agenda|nota|ideia|criar_projeto|conversa", "titulo": "título", "detalhes": "detalhes", "projetos": ["Projeto"], "data_agenda": "DD/MM/YYYY HH:MM ou null", "participantes": [], "novo_projeto": "nome ou null"}"""
+RESPONDA SEMPRE COM JSON VALIDO (sem markdown, sem ```):
+{{"resposta": "texto WhatsApp", "tipo": "tarefa|agenda|nota|ideia|criar_projeto|conversa", "titulo": "titulo", "detalhes": "detalhes", "projetos": ["Projeto"], "data_agenda": "DD/MM/YYYY HH:MM ou null", "participantes": [], "novo_projeto": "nome ou null"}}"""
 
 def montar_system_prompt():
     projetos = get_projects()
-    lista = "\n".join([f"- {n} (aliases: {', '.join(i['aliases'][:3])})" for n,i in projetos.items()]) if projetos else "- Consultorias Estratégicas\n- Career OS\n- Caronas Fácil\n- Casamento Laura"
+    lista = "\n".join([f"- {n} (aliases: {', '.join(i['aliases'][:3])})" for n,i in projetos.items()]) if projetos else "- Consultorias Estrategicas\n- Career OS\n- Caronas Facil\n- Casamento Laura"
     return SYSTEM_PROMPT.format(projetos_lista=lista, hoje=hoje_br(), amanha=amanha_br())
 
 def claude(mensagem):
@@ -132,7 +132,7 @@ def groq_transcrever(audio_url):
             print(f"Audio tentativa {tentativa+1}/3: {e}")
             if "403" not in str(e): time.sleep(3*(tentativa+1))
     if not audio_bytes:
-        raise Exception(f"Audio indisponível: {last_error}")
+        raise Exception(f"Audio indisponivel: {last_error}")
     boundary = "----CareerOSBoundary"
     body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n").encode() + audio_bytes + (f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n--{boundary}--\r\n").encode()
     req = urllib.request.Request(
@@ -194,6 +194,7 @@ def webhook():
         print(f"[{recebido_em}] De {telefone}: {texto[:100]}")
         zapi_enviar(telefone, f"Recebi as {recebido_em[11:]}. Processando...")
         resposta_raw = claude(texto)
+        print(f"[{recebido_em}] Claude raw: {resposta_raw[:200]}")
         try:
             r = json.loads(resposta_raw)
         except:
@@ -212,14 +213,14 @@ def webhook():
             try:
                 adicionar_projeto_registry(novo_projeto)
                 make_enviar({"tipo": "criar_projeto", "text": novo_projeto, "detalhes": detalhes, "fonte": "whatsapp", "recebido_em": recebido_em})
-                zapi_enviar(telefone, f"Novo projeto registrado: {novo_projeto}")
+                zapi_enviar(telefone, f"Novo projeto registrado: {novo_projeto}\nAdicionado ao Projects Registry no Notion.\nAsana + Notion serao criados com o template de governanca.")
             except Exception as e:
-                zapi_enviar(telefone, f"Erro ao criar projeto: {e}")
+                zapi_enviar(telefone, f"Erro ao criar projeto '{novo_projeto}': {e}")
             return jsonify({"status": "ok", "tipo": tipo}), 200
         if tipo in ACOES - {"criar_projeto"} and not projetos and tipo not in {"ideia", "conversa"}:
             projetos_ativos = [n for n, i in get_projects().items() if i["status"] == "ativo"]
             opcoes = "\n".join([f"{i+1}. {p}" for i, p in enumerate(projetos_ativos)])
-            zapi_enviar(telefone, f"Para qual projeto?\n\n{opcoes}\n\nResponda com o numero ou nome.")
+            zapi_enviar(telefone, f"Para qual projeto devo registrar?\n\n{opcoes}\n\nResponda com o numero ou nome do projeto.")
             return jsonify({"status": "ok", "tipo": "aguardando_projeto"}), 200
         if tipo in ACOES and MAKE_WEBHOOK_URL:
             projetos_alvo = projetos if projetos else ["Consultorias Estrategicas"]
@@ -231,8 +232,9 @@ def webhook():
                 except Exception as e:
                     erros.append(proj)
             if not erros:
-                info = f"\n{data_agenda}" if data_agenda else ""
-                zapi_enviar(telefone, f"Registrado! {titulo} em {' + '.join(projetos_alvo)}{info}")
+                info = f"\nData: {data_agenda}" if data_agenda else ""
+                info += f"\nParticipantes: {', '.join(participantes)}" if participantes else ""
+                zapi_enviar(telefone, f"{tipo.capitalize()} registrada!\n{titulo}\nProjeto: {' + '.join(projetos_alvo)}{info}\n{recebido_em}")
             else:
                 zapi_enviar(telefone, f"Falhou em: {', '.join(erros)}. Tente novamente.")
         else:
