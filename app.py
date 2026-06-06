@@ -1,12 +1,13 @@
 """
-Career OS â Agente WhatsApp v5.10
+Career OS â Agente WhatsApp v5.11
 Webhook Z-API â Claude â Make â Asana/Notion/Calendar
-v5.10: strip markdown do JSON do Claude + restaura emojis e PT-BR completo
+v5.11: busca web (wttr.in + DDG + Serper) + prompt geral-purpose + dedup webhooks
 """
 
 from flask import Flask, request, jsonify
 import urllib.request
 import urllib.error
+from urllib.parse import quote
 import json
 import re
 import os
@@ -23,11 +24,13 @@ ZAPI_TOKEN        = os.environ.get("ZAPI_TOKEN", "")
 ZAPI_CLIENT_TOKEN = os.environ.get("ZAPI_CLIENT_TOKEN", "")
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
 MAKE_WEBHOOK_URL  = os.environ.get("MAKE_WEBHOOK_URL", "")
+SERPER_API_KEY    = os.environ.get("SERPER_API_KEY", "")
 RENDER_URL        = os.environ.get("RENDER_URL", "https://careeros-whatsapp-agent.onrender.com")
 
 ZAPI_BASE = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
 PROJECTS_REGISTRY_DB = "376e130d4df4810b9d48df2644609585"
 sent_message_ids = set()
+processed_message_ids = set()  # dedup incoming webhooks duplicados
 _projects_cache = {}
 _projects_cache_ts = 0
 
@@ -76,55 +79,220 @@ def hoje_br():
 def amanha_br():
     return (datetime.now(timezone.utc) - timedelta(hours=3) + timedelta(days=1)).strftime("%d/%m/%Y")
 
-SYSTEM_PROMPT = """Voce e o assistente de IA do Career OS no WhatsApp de Luiz Vechiato.
-Seja inteligente, direto e conversacional. Gerencie projetos, tarefas, agendas, notas e ideias.
+# âââ BUSCA WEB ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+WEATHER_TERMS = ["temperatura", "clima", "tempo", "chuva", "previsÃ£o", "frio", "calor", "graus", "celsius", "weather", "quente", "faz frio"]
+CITIES_MAP = {
+    "sÃ£o paulo": "Sao+Paulo", "sp capital": "Sao+Paulo", "sao paulo": "Sao+Paulo",
+    "rio de janeiro": "Rio+de+Janeiro", "rio": "Rio+de+Janeiro",
+    "belo horizonte": "Belo+Horizonte", "bh": "Belo+Horizonte",
+    "brasÃ­lia": "Brasilia", "brasilia": "Brasilia",
+    "curitiba": "Curitiba", "fortaleza": "Fortaleza", "salvador": "Salvador",
+    "manaus": "Manaus", "porto alegre": "Porto+Alegre", "recife": "Recife",
+    "campinas": "Campinas", "guarulhos": "Guarulhos",
+}
+
+def buscar_clima(query_lower):
+    city = "Sao+Paulo"
+    for k, v in CITIES_MAP.items():
+        if k in query_lower:
+            city = v
+            break
+    try:
+        req = urllib.request.Request(
+            f"https://wttr.in/{city}?format=j1",
+            headers={"User-Agent": "curl/7.64.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        cur = data["current_condition"][0]
+        temp = cur["temp_C"]
+        feels = cur["FeelsLikeC"]
+        desc = cur["weatherDesc"][0]["value"]
+        humidity = cur["humidity"]
+        city_name = city.replace("+", " ")
+        return f"ð¡ï¸ {city_name}: {temp}Â°C (sensaÃ§Ã£o {feels}Â°C)\nâï¸ {desc} | Umidade: {humidity}%"
+    except Exception as e:
+        return f"NÃ£o consegui obter dados de clima: {e}"
+
+def buscar_duckduckgo(query):
+    try:
+        encoded = quote(query)
+        req = urllib.request.Request(
+            f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1",
+            headers={"User-Agent": "python-requests/2.31.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        parts = []
+        if data.get("Answer"):
+            parts.append(f"Resposta: {data['Answer']}")
+        if data.get("AbstractText"):
+            parts.append(data["AbstractText"][:500])
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                parts.append(f"â¢ {topic['Text'][:200]}")
+        return "\n".join(parts) if parts else ""
+    except Exception as e:
+        return f"Erro DDG: {e}"
+
+def buscar_serper(query):
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+    payload = {"q": query, "gl": "br", "hl": "pt-br", "num": 5}
+    req = urllib.request.Request(
+        "https://google.serper.dev/search",
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read())
+    parts = []
+    if data.get("answerBox"):
+        ab = data["answerBox"]
+        ans = ab.get("answer") or ab.get("snippet") or (ab.get("snippetHighlighted") or [""])[0]
+        if ans: parts.append(f"Resposta direta: {ans}")
+    if data.get("knowledgeGraph", {}).get("description"):
+        parts.append(data["knowledgeGraph"]["description"][:300])
+    for item in data.get("organic", [])[:4]:
+        if item.get("snippet"):
+            parts.append(f"â¢ {item.get('title', '')}: {item['snippet']}")
+    return "\n".join(parts) if parts else "Sem resultados relevantes."
+
+def buscar_web(query):
+    query_lower = query.lower()
+    # Clima: usa wttr.in (gratuito, sem API key)
+    if any(t in query_lower for t in WEATHER_TERMS):
+        return buscar_clima(query_lower)
+    # Serper se disponÃ­vel (mais completo)
+    if SERPER_API_KEY:
+        try:
+            return buscar_serper(query)
+        except Exception as e:
+            print(f"Serper error: {e}")
+    # Fallback: DuckDuckGo (sem API key)
+    result = buscar_duckduckgo(query)
+    return result if result else "NÃ£o encontrei informaÃ§Ãµes suficientes sobre isso."
+
+# âââ TOOLS DEFINITION ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+TOOLS = [
+    {
+        "name": "buscar_web",
+        "description": "Busca na web informaÃ§Ãµes atuais: clima, temperatura, cotaÃ§Ãµes, notÃ­cias, preÃ§os, eventos, qualquer dado em tempo real. Use SEMPRE que a pergunta precisar de informaÃ§Ã£o atual ou que vocÃª nÃ£o saiba com certeza.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Termos de busca em portuguÃªs. Ex: 'temperatura SÃ£o Paulo agora', 'dÃ³lar hoje', 'notÃ­cias IA'"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+]
+
+# âââ SYSTEM PROMPT ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+
+SYSTEM_PROMPT = """VocÃª Ã© o assistente de IA do Luiz Vechiato no WhatsApp, integrado ao Career OS.
+
+VocÃª Ã© inteligente, versÃ¡til e Ãºtil. Responda QUALQUER pergunta com inteligÃªncia e precisÃ£o.
+- Para informaÃ§Ãµes em tempo real (clima, cotaÃ§Ãµes, notÃ­cias, eventos): use buscar_web
+- Para gerenciamento de projetos, tarefas, agenda, notas e ideias: classifique e registre
+- Para perguntas gerais, anÃ¡lises e bate-papo: responda diretamente com conhecimento
 
 PROJETOS CONHECIDOS:
 {projetos_lista}
 
-TIPOS DE ACAO (escolha o mais adequado):
+TIPOS DE AÃÃO (escolha o mais adequado):
 - tarefa: criar no Asana do projeto
 - agenda: criar no Google Calendar (com data, hora, participantes)
 - nota: registrar no Notion do projeto
-- ideia: registrar como Ideia no hub Consultorias Estrategicas
+- ideia: registrar como Ideia no hub Consultorias EstratÃ©gicas
 - criar_projeto: criar novo projeto no Asana + Notion
-- conversa: responder diretamente (perguntas, duvidas, bate-papo)
+- conversa: responder diretamente (perguntas, dÃºvidas, anÃ¡lises, buscas, bate-papo)
 
 REGRAS DE PROJETO:
 1. Identifique o projeto pelo nome ou alias
-2. Se acao requer projeto mas nenhum foi identificado, use projetos=[] (sistema perguntara)
-3. Multiplos projetos: ["Projeto A", "Projeto B"] - cria em ambos
+2. Se aÃ§Ã£o requer projeto mas nenhum foi identificado, use projetos=[] (sistema perguntarÃ¡)
+3. MÃºltiplos projetos: ["Projeto A", "Projeto B"] - cria em ambos
 4. Projeto desconhecido mencionado: use tipo=criar_projeto
-5. Ideias sem projeto: tipo=ideia, projetos=["Consultorias Estrategicas"]
+5. Ideias sem projeto: tipo=ideia, projetos=["Consultorias EstratÃ©gicas"]
 
-RESOLUCAO DE DATAS (hoje={hoje}, amanha={amanha}):
-- Resolva datas relativas: "amanha", "sexta", "semana que vem"
+RESOLUÃÃO DE DATAS (hoje={hoje}, amanhÃ£={amanha}):
+- Resolva datas relativas: "amanhÃ£", "sexta", "semana que vem"
 - Formato: DD/MM/YYYY HH:MM
-- Hora nao mencionada: use null
+- Hora nÃ£o mencionada: use null
 
-RESPOSTA: retorne APENAS o JSON abaixo, sem markdown, sem explicacao, sem ```:
+RESPOSTA: retorne APENAS o JSON abaixo, sem markdown, sem explicaÃ§Ã£o, sem ```:
 {{"resposta": "mensagem para o usuario", "tipo": "tarefa|agenda|nota|ideia|criar_projeto|conversa", "titulo": "titulo curto", "detalhes": "detalhes adicionais", "projetos": ["Nome do Projeto"], "data_agenda": "DD/MM/YYYY HH:MM ou null", "participantes": [], "novo_projeto": "nome ou null"}}"""
 
 def montar_system_prompt():
     projetos = get_projects()
-    lista = "\n".join([f"- {n} (aliases: {', '.join(i['aliases'][:3])})" for n, i in projetos.items()]) if projetos else "- Consultorias Estrategicas\n- Career OS\n- Caronas Facil\n- Casamento Laura"
+    lista = "\n".join([f"- {n} (aliases: {', '.join(i['aliases'][:3])})" for n, i in projetos.items()]) if projetos else "- Consultorias EstratÃ©gicas\n- Career OS\n- Caronas FÃ¡cil\n- Casamento Laura"
     return SYSTEM_PROMPT.format(projetos_lista=lista, hoje=hoje_br(), amanha=amanha_br())
 
 def extrair_json(texto):
-    """Extrai JSON do texto, removendo markdown code blocks se necessario."""
+    """Extrai JSON do texto, removendo markdown code blocks se necessÃ¡rio."""
     texto = texto.strip()
-    # Remove ```json ... ``` ou ``` ... ```
     texto = re.sub(r'^```(?:json)?\s*\n?', '', texto, flags=re.MULTILINE)
     texto = re.sub(r'\n?```\s*$', '', texto, flags=re.MULTILINE)
     texto = texto.strip()
     return json.loads(texto)
 
 def claude(mensagem):
-    headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    payload = {"model": "claude-haiku-4-5-20251001", "max_tokens": 1024, "system": montar_system_prompt(), "messages": [{"role": "user", "content": mensagem}]}
-    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())["content"][0]["text"]
+    """Claude com tool use para busca web."""
+    system = montar_system_prompt()
+    messages = [{"role": "user", "content": mensagem}]
+
+    for iteration in range(4):  # max 4 ciclos (tool calls)
+        headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1024,
+            "system": system,
+            "tools": TOOLS,
+            "messages": messages
+        }
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode(),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+
+        stop_reason = resp.get("stop_reason")
+        content = resp.get("content", [])
+        print(f"Claude iter {iteration}: stop_reason={stop_reason}, blocks={[b.get('type') for b in content]}")
+
+        if stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": content})
+            tool_results = []
+            for block in content:
+                if block.get("type") == "tool_use":
+                    print(f"Tool call: {block['name']}({json.dumps(block['input'])[:100]})")
+                    if block["name"] == "buscar_web":
+                        result = buscar_web(block["input"].get("query", ""))
+                    else:
+                        result = "Ferramenta desconhecida"
+                    print(f"Tool result: {result[:200]}")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block["id"],
+                        "content": result
+                    })
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # end_turn: extrai texto
+            for block in content:
+                if block.get("type") == "text":
+                    return block["text"]
+            return ""
+
+    return '{"resposta": "Desculpe, erro no processamento.", "tipo": "conversa", "titulo": "", "detalhes": "", "projetos": [], "data_agenda": null, "participantes": [], "novo_projeto": null}'
 
 def groq_transcrever(audio_url):
     download_headers = {"client-token": ZAPI_CLIENT_TOKEN, "User-Agent": "Mozilla/5.0 (compatible; CareerOS/1.0)"}
@@ -184,10 +352,26 @@ def webhook():
         data = request.get_json(force=True)
         print(f"[{recebido_em}] Webhook: {json.dumps(data)[:300]}")
         msg_id = data.get("messageId") or data.get("id")
-        if msg_id and msg_id in sent_message_ids: return jsonify({"status": "ignored_own"}), 200
+
+        # Dedup: ignorar mensagem jÃ¡ enviada por nÃ³s
+        if msg_id and msg_id in sent_message_ids:
+            return jsonify({"status": "ignored_own"}), 200
+
+        # Dedup: ignorar webhook duplicado da mesma mensagem recebida
+        if msg_id and msg_id in processed_message_ids:
+            print(f"[{recebido_em}] Webhook duplicado ignorado: {msg_id}")
+            return jsonify({"status": "already_processed"}), 200
+        if msg_id:
+            processed_message_ids.add(msg_id)
+            # Limpa set se ficar muito grande (manter Ãºltimos 1000)
+            if len(processed_message_ids) > 1000:
+                oldest = list(processed_message_ids)[:200]
+                for o in oldest: processed_message_ids.discard(o)
+
         if data.get("fromMe") and not data.get("phone"): return jsonify({"status": "ignored_fromMe"}), 200
         telefone = data.get("phone") or data.get("from", "").replace("@c.us", "")
         if not telefone: return jsonify({"status": "no_phone"}), 200
+
         texto = ""
         audio_url = (data.get("audio", {}).get("audioUrl") or data.get("audio", {}).get("url") or (data.get("type") == "audio" and data.get("body")))
         if audio_url and isinstance(audio_url, str) and audio_url.startswith("http"):
@@ -202,6 +386,7 @@ def webhook():
         else:
             texto = (data.get("text", {}).get("message") or data.get("body") or data.get("message") or "")
         if not texto: return jsonify({"status": "no_message"}), 200
+
         print(f"[{recebido_em}] De {telefone}: {texto[:100]}")
         zapi_enviar(telefone, f"Recebi as {recebido_em[11:]}. Processando...")
         resposta_raw = claude(texto)
@@ -225,7 +410,7 @@ def webhook():
             try:
                 adicionar_projeto_registry(novo_projeto)
                 make_enviar({"tipo": "criar_projeto", "text": novo_projeto, "detalhes": detalhes, "fonte": "whatsapp", "recebido_em": recebido_em})
-                zapi_enviar(telefone, f"Novo projeto registrado: {novo_projeto}\nAdicionado ao Projects Registry no Notion.\nAsana + Notion serao criados com o template de governanca.")
+                zapi_enviar(telefone, f"Novo projeto registrado: {novo_projeto}\nAdicionado ao Projects Registry no Notion.\nAsana + Notion serÃ£o criados com o template de governanÃ§a.")
             except Exception as e:
                 zapi_enviar(telefone, f"Erro ao criar projeto '{novo_projeto}': {e}")
             return jsonify({"status": "ok", "tipo": tipo}), 200
@@ -235,7 +420,7 @@ def webhook():
             zapi_enviar(telefone, f"Para qual projeto devo registrar?\n\n{opcoes}\n\nResponda com o numero ou nome do projeto.")
             return jsonify({"status": "ok", "tipo": "aguardando_projeto"}), 200
         if tipo in ACOES and MAKE_WEBHOOK_URL:
-            projetos_alvo = projetos if projetos else ["Consultorias Estrategicas"]
+            projetos_alvo = projetos if projetos else ["Consultorias EstratÃ©gicas"]
             erros = []
             for proj in projetos_alvo:
                 try:
@@ -267,11 +452,11 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "5.10", "ts": agora_br()}), 200
+    return jsonify({"status": "ok", "version": "5.11", "ts": agora_br(), "serper": bool(SERPER_API_KEY)}), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.10"}), 200
+    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.11"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
