@@ -1,13 +1,14 @@
 """
-Career OS — Agente WhatsApp v5.9
-Webhook Z-API → Claude → Make → Asana/Notion/Calendar
-v5.9: fix KeyError SYSTEM_PROMPT.format + User-Agent Groq WAF bypass
+Career OS â Agente WhatsApp v5.10
+Webhook Z-API â Claude â Make â Asana/Notion/Calendar
+v5.10: strip markdown do JSON do Claude + restaura emojis e PT-BR completo
 """
 
 from flask import Flask, request, jsonify
 import urllib.request
 import urllib.error
 import json
+import re
 import os
 import threading
 import time
@@ -61,7 +62,7 @@ def adicionar_projeto_registry(nome, aliases_extra="", descricao=""):
     global _projects_cache_ts
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
-    payload = {"parent": {"database_id": PROJECTS_REGISTRY_DB}, "properties": {"Nome Oficial": {"title": [{"text": {"content": nome}}]}, "Aliases": {"rich_text": [{"text": {"content": aliases_extra or nome.lower()}}]}, "Status": {"select": {"name": "ideia"}}, "Tipo": {"select": {"name": "projeto"}}, "Descricao": {"rich_text": [{"text": {"content": descricao or f"Criado via WhatsApp"}}]}, "Criado em": {"date": {"start": today}}}}
+    payload = {"parent": {"database_id": PROJECTS_REGISTRY_DB}, "properties": {"Nome Oficial": {"title": [{"text": {"content": nome}}]}, "Aliases": {"rich_text": [{"text": {"content": aliases_extra or nome.lower()}}]}, "Status": {"select": {"name": "ideia"}}, "Tipo": {"select": {"name": "projeto"}}, "Descricao": {"rich_text": [{"text": {"content": descricao or "Criado via WhatsApp"}}]}, "Criado em": {"date": {"start": today}}}}
     req = urllib.request.Request("https://api.notion.com/v1/pages", data=json.dumps(payload).encode(), headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         result = json.loads(r.read())
@@ -75,38 +76,48 @@ def hoje_br():
 def amanha_br():
     return (datetime.now(timezone.utc) - timedelta(hours=3) + timedelta(days=1)).strftime("%d/%m/%Y")
 
-SYSTEM_PROMPT = """Voce e o assistente de IA do Career OS, integrado ao WhatsApp de Luiz Vechiato.
-Voce e inteligente, direto e conversacional. Gerencia projetos, tarefas, agendas, notas e ideias.
+SYSTEM_PROMPT = """Voce e o assistente de IA do Career OS no WhatsApp de Luiz Vechiato.
+Seja inteligente, direto e conversacional. Gerencie projetos, tarefas, agendas, notas e ideias.
 
 PROJETOS CONHECIDOS:
 {projetos_lista}
 
-TIPOS DE ACAO:
-- tarefa -> criar no Asana do projeto
-- agenda -> criar no Google Calendar (com data, hora e participantes)
-- nota -> registrar no Notion do projeto
-- ideia -> registrar como Ideia no hub Consultorias Estrategicas
-- criar_projeto -> criar novo projeto no Asana + Notion com template de governanca
-- conversa -> responder diretamente
+TIPOS DE ACAO (escolha o mais adequado):
+- tarefa: criar no Asana do projeto
+- agenda: criar no Google Calendar (com data, hora, participantes)
+- nota: registrar no Notion do projeto
+- ideia: registrar como Ideia no hub Consultorias Estrategicas
+- criar_projeto: criar novo projeto no Asana + Notion
+- conversa: responder diretamente (perguntas, duvidas, bate-papo)
 
 REGRAS DE PROJETO:
 1. Identifique o projeto pelo nome ou alias
-2. Se acao requer projeto e nenhum identificado, defina projetos como [] (sistema vai perguntar)
-3. Uma acao pode ter multiplos projetos: ["Projeto A", "Projeto B"] - cria em duplicidade
-4. Se nome de projeto desconhecido for mencionado, use tipo=criar_projeto
-5. Ideias sem projeto especifico -> tipo=ideia, projetos=["Consultorias Estrategicas"]
+2. Se acao requer projeto mas nenhum foi identificado, use projetos=[] (sistema perguntara)
+3. Multiplos projetos: ["Projeto A", "Projeto B"] - cria em ambos
+4. Projeto desconhecido mencionado: use tipo=criar_projeto
+5. Ideias sem projeto: tipo=ideia, projetos=["Consultorias Estrategicas"]
 
-RESOLUCAO DE DATAS (hoje e {hoje}, amanha e {amanha}):
-- Resolva datas relativas para DD/MM/YYYY HH:MM
-- Se hora nao mencionada, use null
+RESOLUCAO DE DATAS (hoje={hoje}, amanha={amanha}):
+- Resolva datas relativas: "amanha", "sexta", "semana que vem"
+- Formato: DD/MM/YYYY HH:MM
+- Hora nao mencionada: use null
 
-RESPONDA SEMPRE COM JSON VALIDO (sem markdown, sem ```):
-{{"resposta": "texto WhatsApp", "tipo": "tarefa|agenda|nota|ideia|criar_projeto|conversa", "titulo": "titulo", "detalhes": "detalhes", "projetos": ["Projeto"], "data_agenda": "DD/MM/YYYY HH:MM ou null", "participantes": [], "novo_projeto": "nome ou null"}}"""
+RESPOSTA: retorne APENAS o JSON abaixo, sem markdown, sem explicacao, sem ```:
+{{"resposta": "mensagem para o usuario", "tipo": "tarefa|agenda|nota|ideia|criar_projeto|conversa", "titulo": "titulo curto", "detalhes": "detalhes adicionais", "projetos": ["Nome do Projeto"], "data_agenda": "DD/MM/YYYY HH:MM ou null", "participantes": [], "novo_projeto": "nome ou null"}}"""
 
 def montar_system_prompt():
     projetos = get_projects()
-    lista = "\n".join([f"- {n} (aliases: {', '.join(i['aliases'][:3])})" for n,i in projetos.items()]) if projetos else "- Consultorias Estrategicas\n- Career OS\n- Caronas Facil\n- Casamento Laura"
+    lista = "\n".join([f"- {n} (aliases: {', '.join(i['aliases'][:3])})" for n, i in projetos.items()]) if projetos else "- Consultorias Estrategicas\n- Career OS\n- Caronas Facil\n- Casamento Laura"
     return SYSTEM_PROMPT.format(projetos_lista=lista, hoje=hoje_br(), amanha=amanha_br())
+
+def extrair_json(texto):
+    """Extrai JSON do texto, removendo markdown code blocks se necessario."""
+    texto = texto.strip()
+    # Remove ```json ... ``` ou ``` ... ```
+    texto = re.sub(r'^```(?:json)?\s*\n?', '', texto, flags=re.MULTILINE)
+    texto = re.sub(r'\n?```\s*$', '', texto, flags=re.MULTILINE)
+    texto = texto.strip()
+    return json.loads(texto)
 
 def claude(mensagem):
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
@@ -194,10 +205,11 @@ def webhook():
         print(f"[{recebido_em}] De {telefone}: {texto[:100]}")
         zapi_enviar(telefone, f"Recebi as {recebido_em[11:]}. Processando...")
         resposta_raw = claude(texto)
-        print(f"[{recebido_em}] Claude raw: {resposta_raw[:200]}")
+        print(f"[{recebido_em}] Claude raw: {resposta_raw[:300]}")
         try:
-            r = json.loads(resposta_raw)
-        except:
+            r = extrair_json(resposta_raw)
+        except Exception as parse_err:
+            print(f"[{recebido_em}] Parse error: {parse_err} | raw: {resposta_raw[:100]}")
             r = {"resposta": resposta_raw, "tipo": "conversa", "titulo": "", "detalhes": "", "projetos": [], "data_agenda": None, "participantes": [], "novo_projeto": None}
         resposta_texto = r.get("resposta", resposta_raw)
         tipo = r.get("tipo", "conversa")
@@ -255,11 +267,11 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "5.9", "ts": agora_br()}), 200
+    return jsonify({"status": "ok", "version": "5.10", "ts": agora_br()}), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.9"}), 200
+    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.10"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
