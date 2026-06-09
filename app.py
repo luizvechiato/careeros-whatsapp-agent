@@ -1,7 +1,7 @@
 """
-Career OS — Agente WhatsApp v5.6
-Webhook Z-API → Claude → Make → Asana/Notion/Calendar
-v5.4: timestamp BR | v5.5: retry audio | v5.6: ACK imediato + conversa natural + confirmação de resultado
+Career OS — Agente WhatsApp v5.7
+Webhook Z-API → Claude → execução direta Asana/Google Calendar
+v5.7: execução direta Asana/Google Calendar; Make apenas fallback opcional
 """
 
 from flask import Flask, request, jsonify
@@ -12,7 +12,8 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
@@ -24,6 +25,17 @@ ZAPI_TOKEN         = os.environ.get("ZAPI_TOKEN", "")
 ZAPI_CLIENT_TOKEN  = os.environ.get("ZAPI_CLIENT_TOKEN", "")
 GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 MAKE_WEBHOOK_URL   = os.environ.get("MAKE_WEBHOOK_URL", "")
+USE_MAKE_FALLBACK = os.environ.get("USE_MAKE_FALLBACK", "false").lower() == "true"
+
+ASANA_TOKEN = os.environ.get("ASANA_TOKEN", "")
+ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "1214916782248921")
+ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "1215210669565722")
+
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "lhvechiato@gmail.com")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+
 RENDER_URL         = os.environ.get("RENDER_URL", "https://careeros-whatsapp-agent.onrender.com")
 
 ZAPI_BASE = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}"
@@ -56,15 +68,24 @@ RESPONDA SEMPRE COM JSON VÁLIDO:
   "resposta": "texto para enviar no WhatsApp",
   "tipo": "tarefa | agenda | nota | email | planilha | conversa",
   "titulo": "título extraído (vazio se conversa)",
-  "detalhes": "informações complementares (vazio se conversa)"
-}"""
+  "detalhes": "informações complementares (vazio se conversa)",
+  "projeto": "projeto relacionado, se houver",
+  "data_agenda": "data/hora em DD/MM/YYYY HH:mm, obrigatório para agenda quando possível",
+  "participantes": ["nomes dos participantes, sem inventar e-mails"]
+}
+
+REGRAS DE EXTRAÇÃO:
+- Para agenda, tente preencher data_agenda no formato DD/MM/YYYY HH:mm.
+- Se faltar data ou horário para agenda, faça pergunta de confirmação em vez de executar.
+- Para tarefa, use titulo como nome da tarefa e detalhes como descrição.
+- Não invente e-mails de participantes; use apenas nomes quando o usuário falar nomes.
+"""
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def agora_br():
-    """Retorna timestamp em horário de Brasília (UTC-3), formato DD/MM/YYYY HH:MM:SS."""
-    from datetime import timedelta
-    return (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%d/%m/%Y %H:%M:%S")
+    """Retorna timestamp em horário de Brasília, formato DD/MM/YYYY HH:MM:SS."""
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).strftime("%d/%m/%Y %H:%M:%S")
 
 
 def claude(mensagem):
@@ -134,15 +155,23 @@ def groq_transcrever(audio_url):
         return result.get("text", "")
 
 
-def make_enviar(tipo, titulo, detalhes, recebido_em):
-    """Envia payload ao Make webhook com timestamp."""
-    payload = {
-        "text": titulo,
+def montar_payload_padrao(tipo, titulo, detalhes, recebido_em, projeto="", data_agenda="", participantes=None):
+    """Monta o payload padrão usado pelo ecossistema do Luiz."""
+    return {
         "tipo": tipo,
+        "text": titulo,
         "detalhes": detalhes,
+        "projeto": projeto or "",
+        "data_agenda": data_agenda or "",
+        "participantes": participantes or [],
         "fonte": "whatsapp",
-        "recebido_em": recebido_em,            # DD/MM/YYYY HH:MM:SS (Brasília)
+        "recebido_em": recebido_em,
     }
+
+
+def make_enviar(tipo, titulo, detalhes, recebido_em, projeto="", data_agenda="", participantes=None):
+    """Fallback opcional: envia payload ao Make webhook no padrão oficial."""
+    payload = [montar_payload_padrao(tipo, titulo, detalhes, recebido_em, projeto, data_agenda, participantes)]
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         MAKE_WEBHOOK_URL,
@@ -152,6 +181,134 @@ def make_enviar(tipo, titulo, detalhes, recebido_em):
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
+
+
+def asana_criar_tarefa(evento):
+    """Cria tarefa diretamente no Asana, substituindo o módulo asana:CreateTask do Make."""
+    if not ASANA_TOKEN:
+        raise RuntimeError("ASANA_TOKEN não configurado")
+
+    notes = (
+        f"{evento.get('detalhes', '')}\n"
+        f"Projeto: {evento.get('projeto', '')}\n"
+        f"Data: {evento.get('data_agenda', '')}\n"
+        f"Participantes: {', '.join(evento.get('participantes') or [])}"
+    ).strip()
+
+    payload = {
+        "data": {
+            "name": evento.get("text") or "Tarefa sem título",
+            "notes": notes,
+            "workspace": ASANA_WORKSPACE_GID,
+            "projects": [ASANA_PROJECT_GID],
+        }
+    }
+    req = urllib.request.Request(
+        "https://app.asana.com/api/1.0/tasks",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {ASANA_TOKEN}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def google_access_token():
+    """Obtém access token Google via OAuth refresh token."""
+    missing = [name for name, value in {
+        "GOOGLE_CLIENT_ID": GOOGLE_CLIENT_ID,
+        "GOOGLE_CLIENT_SECRET": GOOGLE_CLIENT_SECRET,
+        "GOOGLE_REFRESH_TOKEN": GOOGLE_REFRESH_TOKEN,
+    }.items() if not value]
+    if missing:
+        raise RuntimeError("Credenciais Google ausentes: " + ", ".join(missing))
+
+    form = urllib.parse.urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        token_data = json.loads(r.read())
+    if "access_token" not in token_data:
+        raise RuntimeError("Google OAuth não retornou access_token")
+    return token_data["access_token"]
+
+
+def google_calendar_criar_evento(evento):
+    """Cria evento diretamente no Google Calendar, substituindo o módulo do Make."""
+    data_agenda = evento.get("data_agenda") or ""
+    if not data_agenda:
+        raise RuntimeError("data_agenda é obrigatória para criar evento")
+
+    tz = ZoneInfo("America/Sao_Paulo")
+    try:
+        start_dt = datetime.strptime(data_agenda, "%d/%m/%Y %H:%M").replace(tzinfo=tz)
+    except ValueError as exc:
+        raise RuntimeError("data_agenda deve estar no formato DD/MM/YYYY HH:mm") from exc
+    end_dt = start_dt + timedelta(hours=1)
+
+    body = {
+        "summary": evento.get("text") or "Evento sem título",
+        "description": (
+            f"Projeto: {evento.get('projeto', '')}\n"
+            f"Participantes: {', '.join(evento.get('participantes') or [])}\n"
+            f"Detalhes: {evento.get('detalhes', '')}"
+        ),
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Sao_Paulo"},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": "America/Sao_Paulo"},
+        "visibility": "default",
+        "transparency": "opaque",
+        "guestsCanModify": False,
+        "guestsCanInviteOthers": True,
+        "guestsCanSeeOtherGuests": True,
+    }
+
+    access_token = google_access_token()
+    calendar_id = urllib.parse.quote(GOOGLE_CALENDAR_ID, safe="")
+    req = urllib.request.Request(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events?sendUpdates=all",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def executar_acao(tipo, evento):
+    """Executa ação diretamente no CareerOS; Make fica apenas como fallback opcional."""
+    if tipo == "tarefa":
+        return "Asana", asana_criar_tarefa(evento)
+    if tipo == "agenda":
+        return "Google Calendar", google_calendar_criar_evento(evento)
+
+    if USE_MAKE_FALLBACK and MAKE_WEBHOOK_URL:
+        make_enviar(
+            tipo,
+            evento.get("text", ""),
+            evento.get("detalhes", ""),
+            evento.get("recebido_em", ""),
+            evento.get("projeto", ""),
+            evento.get("data_agenda", ""),
+            evento.get("participantes", []),
+        )
+        return "Make", {"status": "fallback_sent"}
+
+    raise RuntimeError(f"Tipo '{tipo}' ainda não tem executor direto configurado")
 
 
 def zapi_enviar(telefone, mensagem):
@@ -259,32 +416,37 @@ def webhook():
         tipo           = r.get("tipo", "conversa")
         titulo         = r.get("titulo", texto[:60])
         detalhes       = r.get("detalhes", "")
+        projeto        = r.get("projeto", "")
+        data_agenda    = r.get("data_agenda", "")
+        participantes  = r.get("participantes") or []
+        if isinstance(participantes, str):
+            participantes = [p.strip() for p in participantes.split(",") if p.strip()]
 
-        DESTINOS = {
-            "tarefa":    "Asana",
-            "agenda":    "Google Calendar",
-            "nota":      "Notion",
-            "email":     "Outlook",
-            "planilha":  "Excel",
-        }
+        evento = montar_payload_padrao(
+            tipo=tipo,
+            titulo=titulo,
+            detalhes=detalhes,
+            recebido_em=recebido_em,
+            projeto=projeto,
+            data_agenda=data_agenda,
+            participantes=participantes,
+        )
 
-        if tipo in DESTINOS and MAKE_WEBHOOK_URL:
-            destino = DESTINOS[tipo]
+        if tipo in {"tarefa", "agenda", "nota", "email", "planilha"}:
             try:
-                make_enviar(tipo, titulo, detalhes, recebido_em)
-                print(f"[{recebido_em}] Make OK: tipo={tipo}, titulo={titulo}")
-                # Confirmação de sucesso
+                destino, resultado = executar_acao(tipo, evento)
+                print(f"[{recebido_em}] {destino} OK: tipo={tipo}, titulo={titulo}")
                 zapi_enviar(telefone,
                     f"✅ {tipo.capitalize()} registrada no {destino}!\n"
                     f"📌 {titulo}\n"
                     f"🕐 {recebido_em}"
                 )
             except Exception as e:
-                print(f"[{recebido_em}] Erro Make: {e}")
+                print(f"[{recebido_em}] Erro executor direto: {e}")
                 zapi_enviar(telefone,
-                    f"⚠️ Não consegui enviar para o {destino}.\n"
+                    f"⚠️ Não consegui executar {tipo}.\n"
                     f"O que pedi: {titulo}\n"
-                    f"Tente novamente ou acesse o {destino} diretamente."
+                    f"Erro: {str(e)[:120]}"
                 )
         else:
             # Conversa ou pergunta — responde o que o Claude gerou
@@ -317,11 +479,11 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "version": "5.6", "ts": agora_br()}), 200
+    return jsonify({"status": "ok", "version": "5.7", "ts": agora_br()}), 200
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.4"}), 200
+    return jsonify({"service": "Career OS WhatsApp Agent", "version": "5.7"}), 200
 
 
 if __name__ == "__main__":
